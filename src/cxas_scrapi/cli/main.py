@@ -2808,6 +2808,25 @@ def get_parser() -> argparse.ArgumentParser:
         help="Path to the app directory to lint (default: current directory).",
     )
     parser_lint.add_argument(
+        "--manifests-dir",
+        default=None,
+        help=(
+            "Multi-Brand Build manifests directory used by polymorphic rules "
+            "P001/P004 (brand/channel come from deployments/*.yaml or "
+            "--brand/--channel)."
+        ),
+    )
+    parser_lint.add_argument(
+        "--brand",
+        default=None,
+        help="Brand ID override for polymorphic lint rules.",
+    )
+    parser_lint.add_argument(
+        "--channel",
+        default=None,
+        help="Channel override for polymorphic lint rules.",
+    )
+    parser_lint.add_argument(
         "--env-file",
         default=None,
         help=(

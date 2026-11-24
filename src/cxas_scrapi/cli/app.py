@@ -403,6 +403,29 @@ def app_push(args: argparse.Namespace) -> str | None:
     )
 
 
+def _bundle_declares_lock(app_dir: str) -> bool:
+    """True when the local app.json declares the governed lock."""
+    app_json = Path(app_dir) / "app.json"
+    if not app_json.is_file():
+        return False
+    try:
+        data = json.loads(app_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("locked") is True
+
+
+def _is_app_locked(apps_client: Apps | None, app_name: str) -> bool:
+    """True when the remote CES app currently has locked=True."""
+    if apps_client is None:
+        return False
+    try:
+        return getattr(apps_client.get_app(app_name), "locked", False) is True
+    except Exception as e:  # noqa: BLE001
+        print(f"Warning: could not read lock state of {app_name}: {e}")
+        return False
+
+
 def _app_push(
     app_dir: str,
     apps_client: Apps = None,
@@ -434,7 +457,21 @@ def _app_push(
         ".github/workflows",
     ]
 
+    desired_lock = _bundle_declares_lock(app_dir)
+    was_locked = bool(target_app_name) and _is_app_locked(
+        apps_client, target_app_name
+    )
+    relock_target: str | None = None
+
     try:
+        if was_locked:
+            print(
+                f"Target app {target_app_name} is locked; unlocking it for "
+                "import (it will be re-locked afterwards)..."
+            )
+            apps_client.update_app(target_app_name, locked=False)
+            relock_target = target_app_name
+
         for item in valid_roots:
             src_path = os.path.join(app_dir, item)
             if os.path.exists(src_path):
@@ -444,6 +481,24 @@ def _app_push(
                     shutil.copytree(src_path, dst_path)
                 else:
                     shutil.copy2(src_path, dst_path)
+
+        if desired_lock:
+            staged_app_json = Path(inner_dir) / "app.json"
+            if staged_app_json.is_file():
+                staged_data = json.loads(
+                    staged_app_json.read_text(encoding="utf-8")
+                )
+                if isinstance(staged_data, dict):
+                    staged_data["locked"] = False
+                    staged_app_json.write_text(
+                        json.dumps(staged_data, indent=2, ensure_ascii=False)
+                        + "\n",
+                        encoding="utf-8",
+                    )
+            print(
+                "Bundle declares locked=true (governed lock): importing with "
+                "locked=false and applying the lock after import."
+            )
 
         # Inject explicit env_file if provided
         env_file_missing = False
@@ -528,6 +583,8 @@ def _app_push(
         app_name = _handle_import_result(
             result, "pushed to" if identifier else "pushed"
         )
+        if desired_lock and app_name:
+            relock_target = app_name
 
         if args and getattr(args, "create_version", False) and app_name:
             print(f"Creating version for {app_name}...")
@@ -551,12 +608,30 @@ def _app_push(
             )
             args.created_version_name = version_name
 
+        if (desired_lock or was_locked) and app_name:
+            print(f"Locking app {app_name} (locked=true)...")
+            apps_client.update_app(app_name, locked=True)
+            relock_target = None
+            print(f"App {app_name} is locked.")
+
         return app_name
 
     except Exception as e:
         print(f"Failed to push app: {e}")
         sys.exit(1)
     finally:
+        if relock_target and apps_client is not None:
+            print(
+                f"Push did not complete; restoring lock on {relock_target}..."
+            )
+            try:
+                apps_client.update_app(relock_target, locked=True)
+            except Exception as relock_err:  # noqa: BLE001
+                print(
+                    f"ERROR: failed to restore lock on {relock_target}: "
+                    f"{relock_err}",
+                    file=sys.stderr,
+                )
         if os.path.exists(temp_zip):
             os.remove(temp_zip)
         if os.path.exists(temp_dir):
@@ -823,6 +898,12 @@ def app_lint(args: argparse.Namespace) -> None:
         model_override=model_override,
         env_file=resolved_env_file,
     )
+    manifests_arg = getattr(args, "manifests_dir", None)
+    context.manifests_dir = (
+        Path(manifests_arg).resolve() if manifests_arg else None
+    )
+    context.brand_id = getattr(args, "brand", None)
+    context.channel = getattr(args, "channel", None)
 
     if not json_output:
         print(f"Linting app: {discovery.app_root.name}")

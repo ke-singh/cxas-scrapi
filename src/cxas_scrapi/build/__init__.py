@@ -35,6 +35,7 @@ from cxas_scrapi.build.manifests import (
     EnvManifest,
     ManifestError,
     Manifests,
+    ModelPins,
     TtsVoice,
     load_manifests,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "EnvManifest",
     "ManifestError",
     "Manifests",
+    "ModelPins",
     "TtsVoice",
     "build_all",
     "build_app",

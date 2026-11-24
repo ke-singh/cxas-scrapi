@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from cxas_scrapi.build.manifests import (
     CHANNEL_PROFILE_TYPES,
     Manifests,
+    ModelPins,
     load_manifests,
 )
 from cxas_scrapi.core.packaging import package_app_archive
@@ -360,6 +361,89 @@ def _read_json_strict(path: Path) -> Any:
         return json.loads(path.read_text("utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         raise BuildError(f"{path}: invalid JSON: {exc}") from exc
+
+
+def _set_model(holder: dict[str, Any], model: str) -> None:
+    settings = holder.get("modelSettings")
+    if not isinstance(settings, dict):
+        settings = {}
+    settings["model"] = model
+    holder["modelSettings"] = settings
+
+
+def _apply_model_pins(out_dir: Path, pins: ModelPins | None) -> None:
+    """Pins the 3 model slots CES applies (agent, guardrail, data_store)."""
+    if pins is None:
+        return
+
+    def _rewrite(path: Path, fn: Any) -> None:
+        data = _read_json_strict(path)
+        if isinstance(data, dict) and fn(data):
+            path.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+
+    if pins.agent:
+        app_json = out_dir / "app.json"
+        if app_json.is_file():
+            _rewrite(app_json, lambda d: _set_model(d, pins.agent) or True)
+        for agent_json in sorted(out_dir.glob("agents/*/*.json")):
+            if agent_json.stem == agent_json.parent.name:
+                _rewrite(
+                    agent_json, lambda d: _set_model(d, pins.agent) or True
+                )
+
+    if pins.guardrail:
+
+        def _pin_guardrail(d: dict[str, Any]) -> bool:
+            changed = False
+            if isinstance(d.get("llmPolicy"), dict):
+                _set_model(d["llmPolicy"], pins.guardrail)
+                changed = True
+            sec = d.get("llmPromptSecurity")
+            if isinstance(sec, dict) and isinstance(
+                sec.get("customPolicy"), dict
+            ):
+                _set_model(sec["customPolicy"], pins.guardrail)
+                changed = True
+            return changed
+
+        for gr_json in sorted(out_dir.glob("guardrails/*/*.json")):
+            _rewrite(gr_json, _pin_guardrail)
+
+    if pins.data_store:
+
+        def _pin_data_store(d: dict[str, Any]) -> bool:
+            ds = d.get("dataStoreTool")
+            if not isinstance(ds, dict):
+                return False
+            changed = False
+            for cfg in ds.get("modalityConfigs") or []:
+                if not isinstance(cfg, dict):
+                    continue
+                for key in ("rewriterConfig", "summarizationConfig"):
+                    sub = cfg.get(key)
+                    if (
+                        isinstance(sub, dict)
+                        and sub.get("disabled") is not True
+                    ):
+                        _set_model(sub, pins.data_store)
+                        changed = True
+            return changed
+
+        for tool_json in sorted(out_dir.glob("tools/*/*.json")):
+            if tool_json.stem == tool_json.parent.name:
+                _rewrite(tool_json, _pin_data_store)
+
+
+def _apply_lock_policy(out_dir: Path, locked: bool | None) -> None:
+    """Declares the governed lock in app.json (applied by ``cxas push``)."""
+    app_json = out_dir / "app.json"
+    if locked is None or not app_json.is_file():
+        return
+    data = _read_json_strict(app_json)
+    if not isinstance(data, dict):
+        raise BuildError(f"{app_json}: expected JSON object at top level")
+    data["locked"] = bool(locked)
+    app_json.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
 
 
 def build_app(
@@ -798,7 +882,11 @@ def build_app(
                         raise BuildError(f"{path}: {e}") from e
                     path.write_text(text, "utf-8")
 
-    # 5. Emit deployments/<channel>.yaml
+    # 5. Apply environment model pins & governed lock policy
+    _apply_model_pins(out_dir, env_manifest.models)
+    _apply_lock_policy(out_dir, env_manifest.locked)
+
+    # 6. Emit deployments/<channel>.yaml
     deployments_dir = out_dir / "deployments"
     deployments_dir.mkdir(exist_ok=True)
     slug = channel.lower().replace("_", "-")

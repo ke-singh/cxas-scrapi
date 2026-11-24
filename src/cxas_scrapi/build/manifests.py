@@ -93,6 +93,7 @@ class BrandIdentity(_StrictModel):
     lexicon: dict[str, str] = Field(default_factory=dict)
     urls: dict[str, str] = Field(default_factory=dict)
     tts_voices: dict[str, TtsVoice] = Field(default_factory=dict)
+    forbidden_tokens: list[str] = Field(default_factory=list)
 
     @property
     def languages(self) -> list[str]:
@@ -151,6 +152,26 @@ class ChannelPolicy(_StrictModel):
         return value
 
 
+class ModelPins(_StrictModel):
+    """Model slots CES applies, pinned per environment.
+
+    ``agent`` -> ``app.json`` and every agent ``modelSettings.model``;
+    ``guardrail`` -> LLM policy / prompt-security guardrail judge model;
+    ``data_store`` -> data-store tool rewriter and summarizer models.
+    """
+
+    agent: str | None = None
+    guardrail: str | None = None
+    data_store: str | None = None
+
+    @field_validator("agent", "guardrail", "data_store")
+    @classmethod
+    def _non_blank_model(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("model pin must not be blank")
+        return value
+
+
 class EnvManifest(_StrictModel):
     """Environment template manifest (``envs/<environment>.yaml``).
 
@@ -163,6 +184,8 @@ class EnvManifest(_StrictModel):
     environment: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
     templates: dict[str, str] = Field(default_factory=dict)
     overrides: dict[str, Any] = Field(default_factory=dict)
+    locked: bool | None = None
+    models: ModelPins | None = None
 
     @model_validator(mode="before")
     @classmethod

@@ -558,3 +558,67 @@ Severities shown are the defaults. You can override any rule's severity in `cxas
     *Triggers:* `{var}` reference where `var` is not declared or doesn't resolve.
 
     *Fix:* Declare the variable in `app.json` or fix the reference.
+
+=== "P — Multi-Brand Build"
+
+    Rules in the `P` category validate apps built by `cxas build`. `P001` and `P004` use build brand context (resolved automatically from `deployments/*.yaml` plus `--manifests-dir`, or overridden with `--brand` and `--channel`). Without brand context those two rules are skipped cleanly.
+
+    | ID | Name | Default | Description |
+    |----|------|---------|-------------|
+    | P001 | `brand-token-leak` | Error | Built app contains a sister brand's `display_name` or a token from `forbidden_tokens` |
+    | P002 | `agent-tool-count-cap` | Warning | Agent references more than `max_tools` tools (default 20) |
+    | P003 | `unresolved-build-tags` | Error | Built app contains unresolved `@@...@@` placeholders or `{@start/end...}` conditional tags |
+    | P004 | `pruned-resources-absent` | Error | Channel-disabled agents or tools are still present or referenced in the built app |
+    | P005 | `pinned-ga-models` | Error | Explicit model slot uses an alias (`default`, `latest`, `auto`) or a deprecated `gemini-1.x` / `2.0` / `2.5` model |
+
+    ---
+
+    **P001 — brand-token-leak**
+
+    Prevents cross-brand text leaks in multi-brand builds by scanning built text files (`.txt`, `.json`, `.yaml`, `.yml`, `.py`) for every sister brand's `display_name` and any token listed in the target brand's `forbidden_tokens`.
+
+    *Triggers:* A word-bounded match for a sister brand's `display_name` or an explicit `forbidden_tokens` entry.
+
+    *Fix:* Replace hardcoded brand text in `core/` with `@@brand.*@@` tokens or move brand-specific copy into the appropriate brand manifest.
+
+    ---
+
+    **P002 — agent-tool-count-cap**
+
+    Large tool lists degrade tool-selection accuracy and latency. Flags any agent whose `tools` list exceeds `max_tools`.
+
+    *Triggers:* `len(agent["tools"]) > max_tools` (default: `20`).
+
+    *Fix:* Split responsibilities across sub-agents or group related tools into toolsets.
+
+    *Configurable:* Set `options.P002.max_tools` in `cxaslint.yaml`.
+
+    ---
+
+    **P003 — unresolved-build-tags**
+
+    Catches unrendered build placeholders or conditional directives left behind in built output.
+
+    *Triggers:* Any `@@...@@` token, unclosed `@@brand.*`/`@@env.*`/`@@routing.*`/`@@build.*` token, or `{@start/end(Channel|Brand|AgentEnabled|ToolEnabled)_...}` directive in built app files.
+
+    *Fix:* Rebuild with `cxas build` and define the missing value in the build manifests.
+
+    ---
+
+    **P004 — pruned-resources-absent**
+
+    Verifies that agents and tools listed in `disabled_agents` / `disabled_tools` in `channel_policy.yaml` are completely removed from disk, `app.json`, `environment.json`, agent JSON configs, and `.txt` instructions. CES platform system tools (`end_session`, `customize_response`) are exempt from custom-tool pruning checks.
+
+    *Triggers:* A disabled agent or tool directory still exists, or is referenced in `app.json`, `environment.json`, an agent config, or an instruction file.
+
+    *Fix:* Rebuild with `cxas build`, remove the stale reference from `core/`, or guard it with `{@startAgentEnabled_*}` / `{@startToolEnabled_*}`.
+
+    ---
+
+    **P005 — pinned-ga-models**
+
+    Ensures explicit model fields across the three CES-applied slots (`app.json` & agent `modelSettings`, LLM guardrail `llmPolicy` / `llmPromptSecurity.customPolicy`, and enabled data-store `rewriterConfig` / `summarizationConfig`) are pinned to concrete, non-deprecated GA models (such as `gemini-3.5-flash` or `gemini-3.5-flash-lite`).
+
+    *Triggers:* An explicit `modelSettings.model` value is an alias (`default`, `latest`, `auto`, or contains `latest`) or matches a deprecated `gemini-1.x`, `gemini-2.0`, or `gemini-2.5` model.
+
+    *Fix:* Pin explicit GA models in `envs/<environment>.yaml` under `models:` (`agent`, `guardrail`, `data_store`) and rebuild with `cxas build`.
