@@ -30,10 +30,17 @@ import yaml
 from pydantic import BaseModel, Field
 
 from cxas_scrapi.build.drift import write_lockfile
+from cxas_scrapi.build.errors import BuildError
 from cxas_scrapi.build.manifests import (
     CHANNEL_PROFILE_TYPES,
+    COMPOSITION_MODES,
+    CompositionMode,
     Manifests,
     load_manifests,
+)
+from cxas_scrapi.build.overrides import (
+    apply_brand_overrides,
+    pruned_reference_warnings,
 )
 from cxas_scrapi.core.packaging import package_app_archive
 from cxas_scrapi.core.python_bundler import (
@@ -54,10 +61,26 @@ _PY_STR_PREFIX_RE = re.compile(r"^([rRuUbBfF]*)('''|\"\"\"|'|\")")
 _FSTRING_START = getattr(tokenize, "FSTRING_START", None)
 _FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", None)
 _FSTRING_END = getattr(tokenize, "FSTRING_END", None)
-
-
-class BuildError(Exception):
-    """Raised when building a brand/channel app fails."""
+_STAGE_IGNORE_PATTERNS = _CORE_IGNORE_PATTERNS
+_CES_TOP_LEVEL_ENTRIES = frozenset(
+    {
+        "app.json",
+        "app.yaml",
+        "app.yml",
+        "global_instruction.txt",
+        "environment.json",
+        "agents",
+        "tools",
+        "toolsets",
+        "guardrails",
+        "examples",
+        "evaluations",
+        "evaluationDatasets",
+        "evaluationExpectations",
+        "python_lib",
+        "pythonEnvFiles",
+    }
+)
 
 
 class BuildReport(BaseModel):
@@ -69,6 +92,7 @@ class BuildReport(BaseModel):
     out_dir: Path
     zip_path: Path | None = None
     lockfile_path: Path | None = None
+    composition_mode: CompositionMode = "canonical_overlay"
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -370,10 +394,29 @@ def _read_json_strict(path: Path) -> Any:
         raise BuildError(f"{path}: invalid JSON: {exc}") from exc
 
 
-def _validate_core_dir_no_symlinks(core_dir: Path) -> None:
-    """Reject symlinks and paths resolving outside ``core_dir``."""
-    resolved_root = core_dir.resolve()
-    ignore = shutil.ignore_patterns(*_CORE_IGNORE_PATTERNS)
+def _read_resource_display_name(resource_dir: Path) -> str:
+    """Read ``displayName`` from ``<id>.{json,yaml,yml}`` if present."""
+    for suffix in (".json", ".yaml", ".yml"):
+        cfg_path = resource_dir / f"{resource_dir.name}{suffix}"
+        if not cfg_path.is_file():
+            continue
+        if suffix == ".json":
+            data = _read_json_strict(cfg_path)
+        else:
+            try:
+                data = yaml.safe_load(cfg_path.read_text("utf-8"))
+            except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+                raise BuildError(f"{cfg_path}: invalid YAML: {exc}") from exc
+        if isinstance(data, dict) and isinstance(data.get("displayName"), str):
+            return data["displayName"]
+        return ""
+    return ""
+
+
+def _validate_tree_no_symlinks(root_dir: Path, *, label: str) -> None:
+    """Reject symlinks and paths resolving outside ``root_dir``."""
+    resolved_root = root_dir.resolve()
+    ignore = shutil.ignore_patterns(*_STAGE_IGNORE_PATTERNS)
     for root, dirs, files in os.walk(resolved_root, followlinks=False):
         ignored = ignore(root, dirs + files)
         dirs[:] = sorted(d for d in dirs if d not in ignored)
@@ -381,7 +424,7 @@ def _validate_core_dir_no_symlinks(core_dir: Path) -> None:
             entry = Path(root) / name
             if entry.is_symlink():
                 raise BuildError(
-                    f"Symlinks are not permitted in core directory: {entry}"
+                    f"Symlinks are not permitted in {label}: {entry}"
                 )
             resolved = entry.resolve()
             if (
@@ -389,13 +432,13 @@ def _validate_core_dir_no_symlinks(core_dir: Path) -> None:
                 and resolved_root not in resolved.parents
             ):
                 raise BuildError(
-                    f"Path escapes core directory ({resolved_root}): {entry}"
+                    f"Path escapes {label} ({resolved_root}): {entry}"
                 )
         for name in sorted(f for f in files if f not in ignored):
             entry = Path(root) / name
             if entry.is_symlink():
                 raise BuildError(
-                    f"Symlinks are not permitted in core directory: {entry}"
+                    f"Symlinks are not permitted in {label}: {entry}"
                 )
             resolved = entry.resolve()
             if (
@@ -403,8 +446,121 @@ def _validate_core_dir_no_symlinks(core_dir: Path) -> None:
                 and resolved_root not in resolved.parents
             ):
                 raise BuildError(
-                    f"Path escapes core directory ({resolved_root}): {entry}"
+                    f"Path escapes {label} ({resolved_root}): {entry}"
                 )
+
+
+def _find_safe_subdir(
+    candidates: list[tuple[Path, tuple[str, ...]]], *, label: str
+) -> Path | None:
+    """Resolve the first existing directory candidate, rejecting symlinks."""
+    for base, parts in candidates:
+        curr = base
+        found = True
+        for part in parts:
+            curr = curr / part
+            if curr.is_symlink():
+                raise BuildError(
+                    f"Symlinks are not permitted in {label}: {curr}"
+                )
+            if not curr.exists():
+                found = False
+                break
+        if found:
+            if not curr.is_dir():
+                raise BuildError(
+                    f"Expected directory for {label}, got file: {curr}"
+                )
+            resolved_base = base.resolve()
+            resolved_curr = curr.resolve()
+            if (
+                resolved_curr != resolved_base
+                and resolved_base not in resolved_curr.parents
+            ):
+                raise BuildError(
+                    f"Path escapes root ({resolved_base}) for {label}: {curr}"
+                )
+            return resolved_curr
+    return None
+
+
+def _overlay_non_destructive(src_dir: Path, dst_dir: Path) -> None:
+    """Copy ``src_dir`` into ``dst_dir`` without overwriting existing files."""
+    ignore = shutil.ignore_patterns(*_STAGE_IGNORE_PATTERNS)
+    for root, dirs, files in os.walk(src_dir, followlinks=False):
+        ignored = ignore(root, dirs + files)
+        dirs[:] = sorted(d for d in dirs if d not in ignored)
+        rel_root = Path(root).relative_to(src_dir)
+        target_root = dst_dir / rel_root
+        target_root.mkdir(parents=True, exist_ok=True)
+        for fname in sorted(f for f in files if f not in ignored):
+            dst_file = target_root / fname
+            if dst_file.exists():
+                continue
+            shutil.copy2(Path(root) / fname, dst_file)
+
+
+def _stage_brand_native(
+    *,
+    core_dir: Path,
+    manifests_path: Path,
+    brand_id: str,
+    out_dir: Path,
+) -> None:
+    """Stage brand-owned domains as base and overlay shared traits."""
+    domains_dir = _find_safe_subdir(
+        [
+            (core_dir, ("brands", brand_id, "domains")),
+            (manifests_path, ("brands", brand_id, "domains")),
+            (manifests_path.parent, ("brands", brand_id, "domains")),
+        ],
+        label=f"brands/{brand_id}/domains",
+    )
+    traits_dir = _find_safe_subdir(
+        [
+            (core_dir, ("traits",)),
+            (manifests_path.parent, ("traits",)),
+            (manifests_path, ("traits",)),
+        ],
+        label="traits",
+    )
+    if domains_dir is None and traits_dir is None:
+        raise BuildError(
+            f"composition_mode='brand_native' for brand '{brand_id}' requires "
+            f"'brands/{brand_id}/domains/' or 'traits/' (checked under "
+            f"'{core_dir}' and '{manifests_path}')."
+        )
+
+    for src_label, src_dir in (
+        (f"brands/{brand_id}/domains", domains_dir),
+        ("traits", traits_dir),
+    ):
+        if src_dir is not None:
+            if _paths_overlap(out_dir, src_dir):
+                raise BuildError(
+                    f"Output directory '{out_dir}' must not overlap with "
+                    f"{src_label} directory '{src_dir}'."
+                )
+            _validate_tree_no_symlinks(src_dir, label=src_label)
+
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Brand-owned domain files form the base layer (brand always wins).
+    if domains_dir is not None:
+        _overlay_non_destructive(domains_dir, out_dir)
+
+    # Shared traits overlay non-destructively (flat CES tree or named packs).
+    if traits_dir is not None:
+        direct_names = {p.name for p in traits_dir.iterdir()}
+        if direct_names & _CES_TOP_LEVEL_ENTRIES:
+            _overlay_non_destructive(traits_dir, out_dir)
+        else:
+            for pack_dir in sorted(
+                p for p in traits_dir.iterdir() if p.is_dir()
+            ):
+                _overlay_non_destructive(pack_dir, out_dir)
 
 
 def build_app(
@@ -418,6 +574,7 @@ def build_app(
     package_zip: bool = False,
     native_python_env: bool = False,
     write_lock: bool = False,
+    composition_mode: CompositionMode | None = None,
 ) -> BuildReport:
     """Build one CES app for ``(brand_id, channel, environment)``."""
     core_dir = Path(core_dir).resolve()
@@ -444,6 +601,17 @@ def build_app(
     policy = manifests.policy(brand_id)
     env_manifest = manifests.env(environment)
 
+    resolved_mode: CompositionMode = (
+        composition_mode
+        if composition_mode is not None
+        else brand.composition_mode
+    )
+    if resolved_mode not in COMPOSITION_MODES:
+        raise BuildError(
+            f"Unknown composition_mode '{resolved_mode}'; expected one of "
+            f"{sorted(COMPOSITION_MODES)}."
+        )
+
     if channel not in policy.channels:
         raise BuildError(
             f"Channel {channel} not permitted for brand {brand_id}."
@@ -451,14 +619,33 @@ def build_app(
 
     channel_caps = policy.channels[channel]
 
-    # 1. Validate core_dir has no symlinks before staging
-    _validate_core_dir_no_symlinks(core_dir)
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    shutil.copytree(
-        core_dir,
-        out_dir,
-        ignore=shutil.ignore_patterns(*_CORE_IGNORE_PATTERNS),
+    # 1. Clean staging (validating symlinks before touching out_dir)
+    if resolved_mode == "brand_native":
+        _stage_brand_native(
+            core_dir=core_dir,
+            manifests_path=manifests_path,
+            brand_id=brand_id,
+            out_dir=out_dir,
+        )
+    else:
+        _validate_tree_no_symlinks(core_dir, label="core directory")
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        shutil.copytree(
+            core_dir,
+            out_dir,
+            ignore=shutil.ignore_patterns(*_STAGE_IGNORE_PATTERNS),
+        )
+
+    known_agents = (
+        {p.name for p in (out_dir / "agents").iterdir() if p.is_dir()}
+        if (out_dir / "agents").is_dir()
+        else set()
+    )
+    known_tools = (
+        {p.name for p in (out_dir / "tools").iterdir() if p.is_dir()}
+        if (out_dir / "tools").is_dir()
+        else set()
     )
 
     # Ensure environment.json exists when env_manifest defines overrides so it
@@ -481,12 +668,7 @@ def build_app(
     if agents_dir.exists():
         for agent_path in sorted(agents_dir.iterdir()):
             if agent_path.is_dir():
-                a_json = agent_path / f"{agent_path.name}.json"
-                display_name = ""
-                if a_json.exists():
-                    d = _read_json_strict(a_json)
-                    if isinstance(d, dict):
-                        display_name = d.get("displayName", "")
+                display_name = _read_resource_display_name(agent_path)
                 if (
                     agent_path.name in disabled_agents
                     or display_name in disabled_agents
@@ -499,12 +681,7 @@ def build_app(
     if tools_dir.exists():
         for tool_path in sorted(tools_dir.iterdir()):
             if tool_path.is_dir():
-                t_json = tool_path / f"{tool_path.name}.json"
-                display_name = ""
-                if t_json.exists():
-                    d = _read_json_strict(t_json)
-                    if isinstance(d, dict):
-                        display_name = d.get("displayName", "")
+                display_name = _read_resource_display_name(tool_path)
                 if (
                     tool_path.name in disabled_tools
                     or display_name in disabled_tools
@@ -694,6 +871,7 @@ def build_app(
         return val
 
     # 4. Prune references & render tokens across surviving files
+    rendered_identity_block: str | None = None
     for root, dirs, files in os.walk(out_dir):
         dirs.sort()
         for file in sorted(files):
@@ -802,6 +980,7 @@ def build_app(
 
                 if file == "global_instruction.txt":
                     identity_block = _build_identity_block(manifests, brand_id)
+                    rendered_identity_block = process_string(identity_block)
                     if "@@brand.identity_block@@" in text:
                         text = text.replace(
                             "@@brand.identity_block@@", identity_block
@@ -814,19 +993,6 @@ def build_app(
                 except BuildError as e:
                     raise BuildError(f"{path}: {e}") from e
 
-                for a in sorted(all_disabled_agents):
-                    if re.search(rf"\{{@AGENT:\s*{re.escape(a)}\s*\}}", text):
-                        warnings.append(
-                            f"{path.relative_to(out_dir)} mentions pruned "
-                            f"agent {a}"
-                        )
-                for t in sorted(all_disabled_tools):
-                    if re.search(rf"\{{@TOOL:\s*{re.escape(t)}\s*\}}", text):
-                        warnings.append(
-                            f"{path.relative_to(out_dir)} mentions pruned "
-                            f"tool {t}"
-                        )
-
                 try:
                     text = process_string(text)
                 except BuildError as e:
@@ -834,6 +1000,80 @@ def build_app(
 
                 path.write_text(text, "utf-8")
                 validate_modalities(text, path.relative_to(out_dir))
+
+            elif file.endswith((".yaml", ".yml")):
+                try:
+                    text = path.read_text("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise BuildError(
+                        f"{path}: file is not valid UTF-8: {exc}"
+                    ) from exc
+                has_tokens = (
+                    "@@" in text or "{@start" in text or "{@end" in text
+                )
+                needs_prune_check = bool(
+                    all_disabled_agents or all_disabled_tools
+                ) and ("childAgents" in text or "tools" in text)
+                if has_tokens or needs_prune_check:
+                    try:
+                        if has_tokens and (
+                            "{@start" in text or "{@end" in text
+                        ):
+                            text = process_conditional_blocks(text)
+                        data = yaml.safe_load(text)
+                    except (yaml.YAMLError, BuildError) as exc:
+                        raise BuildError(f"{path}: {exc}") from exc
+                    pruned = False
+                    if isinstance(data, dict):
+                        if isinstance(data.get("childAgents"), list):
+                            new_children = [
+                                c
+                                for c in data["childAgents"]
+                                if (
+                                    c.get("displayName")
+                                    if isinstance(c, dict)
+                                    else c
+                                )
+                                not in all_disabled_agents
+                            ]
+                            if len(new_children) != len(data["childAgents"]):
+                                data["childAgents"] = new_children
+                                pruned = True
+                        if isinstance(data.get("tools"), list):
+                            new_tools = [
+                                t
+                                for t in data["tools"]
+                                if (
+                                    t.get("displayName")
+                                    if isinstance(t, dict)
+                                    else t
+                                )
+                                not in all_disabled_tools
+                            ]
+                            if len(new_tools) != len(data["tools"]):
+                                data["tools"] = new_tools
+                                pruned = True
+                        elif isinstance(data.get("tools"), dict):
+                            new_tools_map = {
+                                t_key: t_val
+                                for t_key, t_val in data["tools"].items()
+                                if t_key not in all_disabled_tools
+                            }
+                            if len(new_tools_map) != len(data["tools"]):
+                                data["tools"] = new_tools_map
+                                pruned = True
+                    if has_tokens:
+                        try:
+                            data = process_json(data)
+                        except BuildError as e:
+                            raise BuildError(f"{path}: {e}") from e
+                    if has_tokens or pruned:
+                        path.write_text(
+                            yaml.safe_dump(
+                                data, sort_keys=False, allow_unicode=True
+                            ),
+                            "utf-8",
+                        )
 
             elif file.endswith(".py"):
                 try:
@@ -853,6 +1093,35 @@ def build_app(
                     except BuildError as e:
                         raise BuildError(f"{path}: {e}") from e
                     path.write_text(text, "utf-8")
+
+    # 4b. Apply per-brand & per-channel overrides.yaml layering
+    brand_ov = manifests.brand_overrides(brand_id)
+    if brand_ov is not None:
+        if rendered_identity_block is None:
+            rendered_identity_block = process_string(
+                _build_identity_block(manifests, brand_id)
+            )
+        apply_brand_overrides(
+            out_dir=out_dir,
+            brand_id=brand_id,
+            channel=channel,
+            permitted_channels=set(policy.channels.keys()),
+            ov=brand_ov,
+            render_fn=process_string,
+            global_identity_prefix=rendered_identity_block,
+            global_identity_block=rendered_identity_block,
+            known_agents=known_agents,
+            known_tools=known_tools,
+            validate_modalities_fn=validate_modalities,
+        )
+
+    # Pruned-reference warnings are computed once, deterministically, on the
+    # final (post-override) built instructions.
+    warnings.extend(
+        pruned_reference_warnings(
+            out_dir, all_disabled_agents, all_disabled_tools
+        )
+    )
 
     # 5. Emit deployments/<channel>.yaml
     deployments_dir = out_dir / "deployments"
@@ -913,6 +1182,7 @@ def build_app(
         out_dir=out_dir,
         zip_path=zip_path,
         lockfile_path=lockfile_path,
+        composition_mode=resolved_mode,
         warnings=warnings,
     )
 
@@ -926,6 +1196,7 @@ def build_all(
     package_zip: bool = False,
     native_python_env: bool = False,
     write_locks: bool = False,
+    composition_mode: CompositionMode | None = None,
 ) -> list[BuildReport]:
     """Build every ``(brand_id, channel)`` pair declared in manifests."""
     core_path = Path(core_dir).resolve()
@@ -933,6 +1204,14 @@ def build_all(
         raise BuildError(
             f"Core directory '{core_path}' does not exist or is not a "
             "directory."
+        )
+    if (
+        composition_mode is not None
+        and composition_mode not in COMPOSITION_MODES
+    ):
+        raise BuildError(
+            f"Unknown composition_mode '{composition_mode}'; expected one of "
+            f"{sorted(COMPOSITION_MODES)}."
         )
 
     manifests = load_manifests(manifests_dir)
@@ -954,6 +1233,7 @@ def build_all(
                 package_zip=package_zip,
                 native_python_env=native_python_env,
                 write_lock=write_locks,
+                composition_mode=composition_mode,
             )
             reports.append(rep)
 
