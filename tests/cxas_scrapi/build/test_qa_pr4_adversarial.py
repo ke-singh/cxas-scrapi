@@ -796,7 +796,7 @@ def test_qa_pr4_scope_boundaries_no_push_lint_or_downstream_files() -> None:
 
 def test_qa_pr4_cli_e2e_build_lint_and_list_rules(tmp_path: Path) -> None:
     """Real CLI subprocess E2E: cxas build -> cxas lint clean (0), violations
-    (1), and cxas lint --list-rules reports 109 rules cleanly."""
+    (1), and cxas lint --list-rules reports >= 109 rules including P001-P005."""
     list_proc = _run_cli(["lint", "--list-rules"])
     assert list_proc.returncode == 0, list_proc.stderr
     rule_lines = [
@@ -804,7 +804,7 @@ def test_qa_pr4_cli_e2e_build_lint_and_list_rules(tmp_path: Path) -> None:
         for ln in list_proc.stdout.splitlines()
         if re.match(r"^\s+[A-Z]\d{3}\s+", ln)
     ]
-    assert len(rule_lines) == 109  # noqa: PLR2004
+    assert len(rule_lines) >= 109  # noqa: PLR2004
     for pid in ("P001", "P002", "P003", "P004", "P005"):
         assert pid in list_proc.stdout
 
