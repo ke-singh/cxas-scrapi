@@ -371,6 +371,7 @@ def _render_bundle(
         f"# === BEGIN CXAS_SHARED_BUNDLE (sha256:{digest}) ===",
         "import sys as _cxas_sys, types as _cxas_types",
         f'_CXAS_DIGEST = "{digest}"',
+        '_CXAS_KEEP = ("__name__", "__package__", "__loader__", "__spec__", "__path__", "__builtins__")',  # noqa: E501
     ]
 
     ancestor_packages: set[str] = set(packages)
@@ -408,15 +409,28 @@ def _render_bundle(
             )
 
     # Phase 2: Execute each bundled module in topological order into its
-    # existing namespace, guarded by its per-module content digest.
+    # existing namespace, clearing stale attributes when its digest changes
+    # (preserving attached child submodules on packages).
     for m, src in sorted_modules:
         is_package = m in packages
+        is_pkg = m in ancestor_packages
         mod_digest = _module_digest(m, src)
         filename = _module_filename(m, is_package=is_package)
         bundle_lines.append(
             f'if getattr(_cxas_sys.modules["{m}"], "__cxas_digest__", None) != "{mod_digest}":'  # noqa: E501
         )
         bundle_lines.append(f'    _cxas_mod = _cxas_sys.modules["{m}"]')
+        bundle_lines.append("    for _cxas_k in list(_cxas_mod.__dict__):")
+        if is_pkg:
+            bundle_lines.append("        _cxas_v = _cxas_mod.__dict__[_cxas_k]")
+            bundle_lines.append(
+                f'        if _cxas_k not in _CXAS_KEEP and not (isinstance(_cxas_v, _cxas_types.ModuleType) and getattr(_cxas_v, "__name__", None) == "{m}." + _cxas_k):'  # noqa: E501
+            )
+            bundle_lines.append("            del _cxas_mod.__dict__[_cxas_k]")
+        else:
+            bundle_lines.append("        if _cxas_k not in _CXAS_KEEP:")
+            bundle_lines.append("            del _cxas_mod.__dict__[_cxas_k]")
+        bundle_lines.append("    _cxas_mod.__doc__ = None")
         bundle_lines.append(
             f'    exec(compile({src!r}, "{filename}", "exec"), _cxas_mod.__dict__)'  # noqa: E501
         )

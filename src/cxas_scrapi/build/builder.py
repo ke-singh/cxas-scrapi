@@ -44,6 +44,7 @@ from cxas_scrapi.core.python_bundler import (
 _ALLOWED_ENV_TEMPLATE_VARS = frozenset(
     {"brand", "brand_slug", "env", "channel", "service"}
 )
+_CORE_IGNORE_PATTERNS = ("__pycache__", "*.pyc", ".DS_Store", "manifests")
 _ENV_TEMPLATE_BRACE_RE = re.compile(r"\{([^{}]*)\}")
 _DANGLING_TOKEN_RE = re.compile(
     r"@@(?:brand|env|routing|build)\.[A-Za-z0-9_.:-]+"
@@ -367,6 +368,43 @@ def _read_json_strict(path: Path) -> Any:
         raise BuildError(f"{path}: invalid JSON: {exc}") from exc
 
 
+def _validate_core_dir_no_symlinks(core_dir: Path) -> None:
+    """Reject symlinks and paths resolving outside ``core_dir``."""
+    resolved_root = core_dir.resolve()
+    ignore = shutil.ignore_patterns(*_CORE_IGNORE_PATTERNS)
+    for root, dirs, files in os.walk(resolved_root, followlinks=False):
+        ignored = ignore(root, dirs + files)
+        dirs[:] = sorted(d for d in dirs if d not in ignored)
+        for name in dirs:
+            entry = Path(root) / name
+            if entry.is_symlink():
+                raise BuildError(
+                    f"Symlinks are not permitted in core directory: {entry}"
+                )
+            resolved = entry.resolve()
+            if (
+                resolved != resolved_root
+                and resolved_root not in resolved.parents
+            ):
+                raise BuildError(
+                    f"Path escapes core directory ({resolved_root}): {entry}"
+                )
+        for name in sorted(f for f in files if f not in ignored):
+            entry = Path(root) / name
+            if entry.is_symlink():
+                raise BuildError(
+                    f"Symlinks are not permitted in core directory: {entry}"
+                )
+            resolved = entry.resolve()
+            if (
+                resolved != resolved_root
+                and resolved_root not in resolved.parents
+            ):
+                raise BuildError(
+                    f"Path escapes core directory ({resolved_root}): {entry}"
+                )
+
+
 def build_app(
     core_dir: str | Path,
     manifests_dir: str | Path,
@@ -410,15 +448,14 @@ def build_app(
 
     channel_caps = policy.channels[channel]
 
-    # 1. Clean staging
+    # 1. Validate core_dir has no symlinks before staging
+    _validate_core_dir_no_symlinks(core_dir)
     if out_dir.exists():
         shutil.rmtree(out_dir)
     shutil.copytree(
         core_dir,
         out_dir,
-        ignore=shutil.ignore_patterns(
-            "__pycache__", "*.pyc", ".DS_Store", "manifests"
-        ),
+        ignore=shutil.ignore_patterns(*_CORE_IGNORE_PATTERNS),
     )
 
     # Ensure environment.json exists when env_manifest defines overrides so it
