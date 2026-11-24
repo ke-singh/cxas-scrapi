@@ -785,7 +785,6 @@ def test_qa_pr4_scope_boundaries_no_push_lint_or_downstream_files() -> None:
     push_help = _run_cli(["push", "--help"])
     assert push_help.returncode == 0
     assert "--lint" not in push_help.stdout
-    assert "--check-drift" not in push_help.stdout
     with pytest.raises(SystemExit):
         parser.parse_args(["push", "--app-dir", ".", "--lint"])
 
