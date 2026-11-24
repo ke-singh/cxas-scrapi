@@ -2742,6 +2742,14 @@ def get_parser() -> argparse.ArgumentParser:
             "the exported app will be deleted."
         ),
     )
+    parser_pull.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Strip CXAS_SHARED_BUNDLE blocks even if their digest does not "
+            "match (discards edits made inside the bundle block)."
+        ),
+    )
     _add_project_location_args(parser_pull, required=False)
     parser_pull.set_defaults(func=app_pull)
 
@@ -2794,6 +2802,11 @@ def get_parser() -> argparse.ArgumentParser:
             "that do not have a matching display name in the imported app "
             "will be deleted"
         ),
+    )
+    parser_push.add_argument(
+        "--native-python-env",
+        action="store_true",
+        help="Synthesize pythonEnvFiles.yaml without mutating python_code.py",
     )
     parser_push.set_defaults(func=app_push)
 

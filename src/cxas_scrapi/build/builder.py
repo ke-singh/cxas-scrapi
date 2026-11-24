@@ -35,6 +35,11 @@ from cxas_scrapi.build.manifests import (
     load_manifests,
 )
 from cxas_scrapi.core.packaging import package_app_archive
+from cxas_scrapi.core.python_bundler import (
+    PythonBundlerError,
+    bundle_shared_python,
+    synthesize_python_env_files,
+)
 
 _ALLOWED_ENV_TEMPLATE_VARS = frozenset(
     {"brand", "brand_slug", "env", "channel", "service"}
@@ -371,6 +376,7 @@ def build_app(
     out_dir: str | Path,
     *,
     package_zip: bool = False,
+    native_python_env: bool = False,
 ) -> BuildReport:
     """Build one CES app for ``(brand_id, channel, environment)``."""
     core_dir = Path(core_dir).resolve()
@@ -821,13 +827,28 @@ def build_app(
     with open(dep_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(dep_data, f, sort_keys=False)
 
+    # 5b. Shared Python bundling / pythonEnvFiles synthesis for python_lib/
+    if (out_dir / "python_lib").is_dir() or (
+        out_dir / "pythonEnvFiles" / "content" / "python_lib"
+    ).is_dir():
+        try:
+            synthesize_python_env_files(out_dir)
+            bundle_shared_python(out_dir, native_python_env=native_python_env)
+        except PythonBundlerError as exc:
+            raise BuildError(f"Failed to bundle shared Python: {exc}") from exc
+
     # 6. Optional deterministic ZIP package (with env var & boolean resolution)
     zip_path = None
     if package_zip:
         zip_path = out_dir / f"{brand_id}_{slug}.zip"
         try:
-            package_app_archive(out_dir, zip_path, resolved_env_vars=[])
-        except (OSError, ValueError) as exc:
+            package_app_archive(
+                out_dir,
+                zip_path,
+                native_python_env=native_python_env,
+                resolved_env_vars=[],
+            )
+        except (OSError, ValueError, PythonBundlerError) as exc:
             raise BuildError(f"Failed to package {zip_path}: {exc}") from exc
 
     return BuildReport(
@@ -847,6 +868,7 @@ def build_all(
     environment: str,
     *,
     package_zip: bool = False,
+    native_python_env: bool = False,
 ) -> list[BuildReport]:
     """Build every ``(brand_id, channel)`` pair declared in manifests."""
     core_path = Path(core_dir).resolve()
@@ -873,6 +895,7 @@ def build_all(
                 environment=environment,
                 out_dir=out_dir,
                 package_zip=package_zip,
+                native_python_env=native_python_env,
             )
             reports.append(rep)
 

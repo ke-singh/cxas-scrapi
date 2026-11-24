@@ -29,12 +29,12 @@ from typing import Any
 
 from cxas_scrapi.core.apps import Apps
 from cxas_scrapi.core.common import Common
+from cxas_scrapi.core.python_bundler import strip_shared_bundles
 from cxas_scrapi.core.versions import Versions
 from cxas_scrapi.utils.env_vars import (
     collect_env_var_declaration_names,
     extract_env_variable_defaults,
     preserve_env_var_placeholders_on_pull,
-    resolve_app_env_variables_in_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -168,6 +168,7 @@ def app_pull(args: argparse.Namespace) -> None:
         getattr(args, "overwrite", False),
         app_version=app_version,
         app_dir_name=getattr(args, "app_dir_name", None),
+        args=args,
     )
 
 
@@ -178,6 +179,7 @@ def _app_pull(
     overwrite: bool = False,
     app_version: str | None = None,
     app_dir_name: str | None = None,
+    args: argparse.Namespace | None = None,
 ) -> None:
     """Helper to pull an app from CXAS."""
     try:
@@ -351,6 +353,9 @@ def _app_pull(
                                 )
                                 os.rmdir(dir_path)
 
+        force_strip = getattr(args, "force", False) if args else False
+        strip_shared_bundles(Path(pulled_app_root), force=force_strip)
+
         if prev_env_vars:
             preserved = preserve_env_var_placeholders_on_pull(
                 pulled_app_root,
@@ -413,98 +418,57 @@ def _app_push(
     args: argparse.Namespace | None = None,
 ) -> str | None:
     """Helper to push an app to CXAS."""
-    temp_dir = tempfile.mkdtemp()
-    temp_zip = tempfile.mktemp(suffix=".zip")
-    inner_dir = os.path.join(temp_dir, "agent")
-    os.makedirs(inner_dir)
+    from cxas_scrapi.core.packaging import package_app_archive  # noqa: PLC0415
 
-    valid_roots = [
-        "app.yaml",
-        "app.json",
-        "global_instruction.txt",
-        "environment.json",
-        "agents",
-        "tools",
-        "examples",
-        "guardrails",
-        "toolsets",
-        "evaluations",
-        "evaluationDatasets",
-        "evaluationExpectations",
-        ".github/workflows",
-    ]
+    native_python_env = (
+        getattr(args, "native_python_env", False) if args else False
+    )
 
     try:
-        for item in valid_roots:
-            src_path = os.path.join(app_dir, item)
-            if os.path.exists(src_path):
-                dst_path = os.path.join(inner_dir, item)
-                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                if os.path.isdir(src_path):
-                    shutil.copytree(src_path, dst_path)
-                else:
-                    shutil.copy2(src_path, dst_path)
-
         # Inject explicit env_file if provided
-        env_file_missing = False
+        env_path: Path | None = None
         if env_file:
             if os.path.exists(env_file):
-                dst_path = os.path.join(inner_dir, "environment.json")
-                shutil.copy2(env_file, dst_path)
+                env_path = Path(env_file)
                 print(
                     f"Included custom environment file "
                     f"from {env_file} as environment.json"
                 )
             else:
-                env_file_missing = True
                 print(
                     f"Warning: Custom environment file "
                     f"'{env_file}' not found. Skipping."
                 )
+                from cxas_scrapi.utils.tracing.app_config import (  # noqa: PLC0415
+                    has_bool_env_var_placeholders,
+                )
 
-        from cxas_scrapi.utils.tracing.app_config import (  # noqa: PLC0415
-            has_bool_env_var_placeholders,
-            resolve_env_booleans_in_dir,
-        )
+                if collect_env_var_declaration_names(
+                    app_dir
+                ) or has_bool_env_var_placeholders(app_dir):
+                    raise FileNotFoundError(
+                        f"Custom environment file '{env_file}' not found; "
+                        "required to resolve '$env_var' placeholders"
+                    )
 
-        if env_file_missing and (
-            collect_env_var_declaration_names(inner_dir)
-            or has_bool_env_var_placeholders(inner_dir)
-        ):
-            raise FileNotFoundError(
-                f"Custom environment file '{env_file}' not found; required to "
-                "resolve '$env_var' placeholders"
+        resolved_vars: list[str] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_zip = Path(temp_dir) / "app.zip"
+            package_app_archive(
+                Path(app_dir),
+                temp_zip,
+                env_path,
+                native_python_env=native_python_env,
+                wrapper_dir="agent",
+                resolved_env_vars=resolved_vars,
             )
-
-        resolved_vars = resolve_app_env_variables_in_dir(inner_dir)
-        if resolved_vars:
-            print(
-                f"Resolved {len(resolved_vars)} '$env_var' variable "
-                f"default(s) from environment.json: {', '.join(resolved_vars)}"
-            )
-
-        # Resolve boolean $env_var placeholders and boolean environment
-        # overrides in the staged inner_dir before creating the zip archive.
-        resolve_env_booleans_in_dir(inner_dir)
-
-        # ZIP does not support timestamps before 1980.
-        # Touch files and directories in temp_dir with timestamps before 1980.
-        limit_time = time.mktime((1980, 1, 1, 0, 0, 0, 0, 0, 0))
-        for root, dirs, files in os.walk(temp_dir):
-            for name in files:
-                path = os.path.join(root, name)
-                if os.path.getmtime(path) < limit_time:
-                    os.utime(path, None)
-            for name in dirs:
-                path = os.path.join(root, name)
-                if os.path.getmtime(path) < limit_time:
-                    os.utime(path, None)
-
-        # Zip the filtered agent directory
-        shutil.make_archive(temp_zip.replace(".zip", ""), "zip", temp_dir)
-
-        with open(temp_zip, "rb") as f:
-            app_content = f.read()
+            if resolved_vars:
+                print(
+                    f"Resolved {len(resolved_vars)} '$env_var' variable "
+                    f"default(s) from environment.json: "
+                    f"{', '.join(resolved_vars)}"
+                )
+            app_content = temp_zip.read_bytes()
 
         # If no target is specified, the SDK creates a new app with the
         # provided display_name.
@@ -556,11 +520,6 @@ def _app_push(
     except Exception as e:
         print(f"Failed to push app: {e}")
         sys.exit(1)
-    finally:
-        if os.path.exists(temp_zip):
-            os.remove(temp_zip)
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def app_create(args: argparse.Namespace) -> None:

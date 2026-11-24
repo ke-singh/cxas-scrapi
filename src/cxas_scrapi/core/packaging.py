@@ -22,6 +22,13 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+from cxas_scrapi.core.python_bundler import (
+    MAX_TOTAL_ARCHIVE_BYTES,
+    BundleSizeError,
+    bundle_shared_python,
+    synthesize_python_env_files,
+)
+
 # Standard CES app archive roots plus pythonEnvFiles.
 VALID_ARCHIVE_ROOTS: frozenset[str] = frozenset(
     {
@@ -95,6 +102,7 @@ def package_app_archive(
     output_zip: Path,
     env_file: Path | None = None,
     *,
+    native_python_env: bool = False,
     wrapper_dir: str | None = None,
     resolve_env: bool = True,
     resolved_env_vars: list[str] | None = None,
@@ -105,12 +113,18 @@ def package_app_archive(
     top level of ``app_dir``. Sorts entries and normalizes ZIP metadata so
     identical inputs produce byte-identical archives.
 
+    If ``python_lib/`` is present in ``app_dir``, synthesizes
+    ``pythonEnvFiles/`` and bundles shared imports into callback and Python tool
+    entrypoints unless ``native_python_env=True``. Raw ``python_lib/`` is not
+    included in the output archive.
+
     When ``resolve_env`` is True (or ``resolved_env_vars`` is provided),
     ``"$env_var"`` variable defaults and boolean environment overrides in the
     staged app config are resolved from the staged ``environment.json`` (after
     ``env_file`` is applied). If ``resolved_env_vars`` is a list, resolved
     variable names are appended to it. Raises ``ValueError`` if a placeholder
-    cannot be resolved or if ``wrapper_dir`` is unsafe.
+    cannot be resolved or if ``wrapper_dir`` is unsafe, and ``BundleSizeError``
+    if the total uncompressed archive exceeds ``MAX_TOTAL_ARCHIVE_BYTES``.
     """
     app_dir = Path(app_dir).resolve()
     output_zip = Path(output_zip).resolve()
@@ -130,7 +144,7 @@ def package_app_archive(
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
 
-        for root_name in sorted(VALID_ARCHIVE_ROOTS):
+        for root_name in sorted(VALID_ARCHIVE_ROOTS | {"python_lib"}):
             src_path = app_dir / root_name
             if not src_path.exists():
                 continue
@@ -160,6 +174,16 @@ def package_app_archive(
                 resolved_env_vars.extend(resolved)
             resolve_env_booleans_in_dir(str(temp_dir))
 
+        synthesize_python_env_files(temp_dir)
+        bundle_shared_python(temp_dir, native_python_env=native_python_env)
+
+        staged_python_lib = temp_dir / "python_lib"
+        if staged_python_lib.exists():
+            if staged_python_lib.is_dir():
+                shutil.rmtree(staged_python_lib)
+            else:
+                staged_python_lib.unlink()
+
         entries: list[tuple[str, Path]] = []
         for root, dirs, files in os.walk(temp_dir):
             dirs.sort()
@@ -171,6 +195,13 @@ def package_app_archive(
                 if wrapper_prefix is not None:
                     rel_posix = wrapper_prefix / rel_posix
                 entries.append((rel_posix.as_posix(), fpath))
+
+        total_size = sum(fpath.stat().st_size for _, fpath in entries)
+        if total_size > MAX_TOTAL_ARCHIVE_BYTES:
+            raise BundleSizeError(
+                f"Total archive size {total_size} exceeds maximum "
+                f"{MAX_TOTAL_ARCHIVE_BYTES} bytes"
+            )
 
         entries.sort(key=lambda item: item[0])
         output_zip.parent.mkdir(parents=True, exist_ok=True)
