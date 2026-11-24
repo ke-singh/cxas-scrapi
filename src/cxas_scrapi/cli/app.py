@@ -919,8 +919,6 @@ def app_lint(args: argparse.Namespace) -> None:
                 "Use --app-dir to specify the app location."
             )
         else:
-            import json  # noqa: PLC0415
-
             print(
                 json.dumps(
                     [
