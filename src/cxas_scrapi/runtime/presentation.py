@@ -45,9 +45,10 @@ def adapt_presentation(
     part_factory: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Inspects channel_class and adapts presentation to voice or digital."""
-    raw_ctx = state.get("context")
+    raw_ctx = state.get("context") if isinstance(state, Mapping) else None
     ctx = raw_ctx if isinstance(raw_ctx, Mapping) else {}
     channel_class = ctx.get("channel_class", "")
+    text = "" if spoken_text is None else str(spoken_text)
 
     if isinstance(channel_class, str) and channel_class in DIGITAL_CHANNELS:
         json_str = (
@@ -67,17 +68,30 @@ def adapt_presentation(
                 )
         return {
             "channel_mode": "digital",
-            "text": spoken_text,
+            "text": text,
             "widget_json": json_str,
             "part": part_obj,
         }
 
-    # Voice / telephony
-    cleaned_text = spoken_text
+    # Voice / telephony: scrub Markdown without mangling snake_case identifiers.
+    cleaned_text = text
+    cleaned_text = re.sub(
+        r"```[a-zA-Z0-9_+-]*[ \t]*\r?\n?([\s\S]*?)```", r"\1", cleaned_text
+    )
     cleaned_text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned_text)
     cleaned_text = re.sub(r"https?://[^\s]+", "", cleaned_text)
-    cleaned_text = re.sub(r"[*_]{1,2}([^*_]+)[*_]{1,2}", r"\1", cleaned_text)
+    cleaned_text = re.sub(
+        r"^[ \t]*#{1,6}[ \t]+", "", cleaned_text, flags=re.MULTILINE
+    )
+    cleaned_text = re.sub(
+        r"^[ \t]*[-*+][ \t]+", "", cleaned_text, flags=re.MULTILINE
+    )
+    cleaned_text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", cleaned_text)
+    cleaned_text = re.sub(
+        r"(?<!\w)_{1,3}([^_]+)_{1,3}(?!\w)", r"\1", cleaned_text
+    )
     cleaned_text = re.sub(r"`([^`]+)`", r"\1", cleaned_text)
+    cleaned_text = cleaned_text.replace("`", "")
     cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
 
     return {

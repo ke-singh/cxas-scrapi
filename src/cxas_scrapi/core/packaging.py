@@ -75,8 +75,20 @@ def _validate_wrapper_dir(wrapper_dir: str) -> PurePosixPath:
     return posix
 
 
-def _copy_filtered_tree(src: Path, dst: Path) -> None:
+def _assert_safe_path(path: Path, app_root: Path) -> None:
+    """Reject symlinks and paths resolving outside ``app_root``."""
+    if path.is_symlink():
+        raise ValueError(
+            f"Symlinks are not permitted when packaging app: {path}"
+        )
+    resolved = path.resolve()
+    if resolved != app_root and app_root not in resolved.parents:
+        raise ValueError(f"Path escapes app directory ({app_root}): {path}")
+
+
+def _copy_filtered_tree(src: Path, dst: Path, *, app_root: Path) -> None:
     """Copy a directory tree while skipping hidden entries and bytecode."""
+    _assert_safe_path(src, app_root)
     for root, dirs, files in os.walk(src):
         rel_root = Path(root).relative_to(src)
         dirs[:] = sorted(
@@ -84,6 +96,8 @@ def _copy_filtered_tree(src: Path, dst: Path) -> None:
             for d in dirs
             if not d.startswith(".") and d not in _EXCLUDED_DIR_NAMES
         )
+        for dname in dirs:
+            _assert_safe_path(Path(root) / dname, app_root)
         for fname in sorted(files):
             if (
                 fname.startswith(".")
@@ -92,6 +106,7 @@ def _copy_filtered_tree(src: Path, dst: Path) -> None:
             ):
                 continue
             src_fpath = Path(root) / fname
+            _assert_safe_path(src_fpath, app_root)
             dst_fpath = dst / rel_root / fname
             dst_fpath.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src_fpath, dst_fpath)
@@ -146,11 +161,21 @@ def package_app_archive(
 
         for root_name in sorted(VALID_ARCHIVE_ROOTS | {"python_lib"}):
             src_path = app_dir / root_name
+            # Check intermediate segments (e.g. .github) and leaf for symlinks
+            # even when the symlink target is missing (broken symlink).
+            curr = app_dir
+            for part in PurePosixPath(root_name).parts:
+                curr = curr / part
+                if curr.is_symlink():
+                    raise ValueError(
+                        f"Symlinks are not permitted when packaging app: {curr}"
+                    )
             if not src_path.exists():
                 continue
+            _assert_safe_path(src_path, app_dir)
             dst_path = temp_dir / root_name
             if src_path.is_dir():
-                _copy_filtered_tree(src_path, dst_path)
+                _copy_filtered_tree(src_path, dst_path, app_root=app_dir)
             elif src_path.is_file():
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src_path, dst_path)

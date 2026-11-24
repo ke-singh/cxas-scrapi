@@ -17,10 +17,11 @@
 import io
 import logging
 import os
+import shutil
 import tempfile
 import typing
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from google.cloud.ces_v1beta import AgentServiceClient, types
@@ -29,6 +30,22 @@ from google.protobuf import field_mask_pb2
 from cxas_scrapi.core.common import Common
 from cxas_scrapi.core.packaging import package_app_archive
 from cxas_scrapi.core.python_bundler import strip_shared_bundles
+
+
+def validate_zip_entry_name(filename: str) -> None:
+    """Reject ZIP archive entries attempting POSIX or Windows path traversal."""
+    if "\\" in filename or filename.startswith("/") or "\x00" in filename:
+        raise ValueError(
+            f"Path traversal detected in archive entry: {filename}"
+        )
+    posix = PurePosixPath(filename)
+    if posix.is_absolute() or any(
+        part == ".." or (len(part) >= 2 and part[1] == ":")
+        for part in posix.parts
+    ):
+        raise ValueError(
+            f"Path traversal detected in archive entry: {filename}"
+        )
 
 
 class Apps(Common):
@@ -388,10 +405,20 @@ class Apps(Common):
     ) -> Path:
         """Extract exported app zip bytes and strip bundled Python markers."""
         target_path = Path(target_dir).resolve()
-        target_path.mkdir(parents=True, exist_ok=True)
         top_dir = ""
         with zipfile.ZipFile(io.BytesIO(app_content)) as z:
             members = z.namelist()
+            for info in z.infolist():
+                validate_zip_entry_name(info.filename)
+                member_dest = (target_path / info.filename).resolve()
+                if (
+                    member_dest != target_path
+                    and target_path not in member_dest.parents
+                ):
+                    raise ValueError(
+                        "Path traversal detected in archive entry: "
+                        f"{info.filename}"
+                    )
             if members:
                 first = members[0].split("/")[0]
                 if (
@@ -402,17 +429,25 @@ class Apps(Common):
                     )
                 ):
                     top_dir = first
-            for info in z.infolist():
-                member_dest = (target_path / info.filename).resolve()
-                if (
-                    member_dest != target_path
-                    and target_path not in member_dest.parents
-                ):
-                    raise ValueError(
-                        "Path traversal detected in archive entry: "
-                        f"{info.filename}"
-                    )
-            z.extractall(target_path)
-        app_root = target_path / top_dir if top_dir else target_path
-        strip_shared_bundles(app_root, force=force_strip_bundles)
-        return app_root
+
+            with tempfile.TemporaryDirectory() as stage_dir:
+                stage_path = Path(stage_dir)
+                z.extractall(stage_path)
+                staged_root = stage_path / top_dir if top_dir else stage_path
+                existing_root = (
+                    target_path / top_dir if top_dir else target_path
+                )
+                has_local_lib = (existing_root / "python_lib").is_dir() or (
+                    existing_root / "pythonEnvFiles" / "content" / "python_lib"
+                ).is_dir()
+                strip_shared_bundles(
+                    staged_root,
+                    local_source_dir=(
+                        existing_root if has_local_lib else staged_root
+                    ),
+                    force=force_strip_bundles,
+                )
+                target_path.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(stage_path, target_path, dirs_exist_ok=True)
+
+        return target_path / top_dir if top_dir else target_path

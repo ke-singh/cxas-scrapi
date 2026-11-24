@@ -753,7 +753,12 @@ def build_app(
                 path.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
 
             elif file.endswith(".txt"):
-                text = path.read_text("utf-8")
+                try:
+                    text = path.read_text("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise BuildError(
+                        f"{path}: file is not valid UTF-8: {exc}"
+                    ) from exc
 
                 if file == "global_instruction.txt":
                     identity_block = _build_identity_block(manifests, brand_id)
@@ -791,7 +796,12 @@ def build_app(
                 validate_modalities(text, path.relative_to(out_dir))
 
             elif file.endswith(".py"):
-                text = path.read_text("utf-8")
+                try:
+                    text = path.read_text("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise BuildError(
+                        f"{path}: file is not valid UTF-8: {exc}"
+                    ) from exc
                 if "@@" in text or "{@start" in text or "{@end" in text:
                     try:
                         text = _render_python_source(

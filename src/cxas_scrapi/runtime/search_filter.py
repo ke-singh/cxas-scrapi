@@ -39,11 +39,53 @@ def quoted_filter_literal(raw: str) -> str:
     return '"' + escape_search_filter_literal(raw) + '"'
 
 
+def _validate_extra_clause(clause: str) -> str:
+    """Validate an extra datastore filter clause against malformation."""
+    if not isinstance(clause, str) or not clause.strip():
+        raise ValueError("Invalid empty clause in extra_clauses")
+
+    for ch in clause:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise ValueError(
+                f"Invalid control character in extra_clauses clause: {ch!r}"
+            )
+
+    depth = 0
+    in_quote: str | None = None
+    escaped = False
+    for ch in clause:
+        if escaped:
+            escaped = False
+            continue
+        if in_quote is not None:
+            if ch == "\\":
+                escaped = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ('"', "'"):
+            in_quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                raise ValueError(
+                    "Unbalanced parentheses in extra_clauses clause"
+                )
+
+    if in_quote is not None:
+        raise ValueError("Unterminated string literal in extra_clauses clause")
+    if depth != 0:
+        raise ValueError("Unbalanced parentheses in extra_clauses clause")
+    return clause
+
+
 def build_scoped_datastore_filter(
     state: Mapping[str, Any], *, extra_clauses: Sequence[str] = ()
 ) -> str:
     """Reads context keys and emits scoped datastore filter."""
-    raw_ctx = state.get("context")
+    raw_ctx = state.get("context") if isinstance(state, Mapping) else None
     ctx = raw_ctx if isinstance(raw_ctx, Mapping) else {}
     brand = ctx.get("brand_id")
     country = ctx.get("country_code")
@@ -51,11 +93,11 @@ def build_scoped_datastore_filter(
 
     if (
         not isinstance(brand, str)
-        or not brand
+        or not brand.strip()
         or not isinstance(country, str)
-        or not country
+        or not country.strip()
         or not isinstance(lang, str)
-        or not lang
+        or not lang.strip()
     ):
         raise ValueError(f"Missing required context keys: {ctx}")
 
@@ -68,8 +110,15 @@ def build_scoped_datastore_filter(
         f" AND language: ANY({lang_q})"
     )
 
+    if isinstance(extra_clauses, (str, bytes)):
+        raise ValueError(
+            "extra_clauses must be a sequence of clause strings, "
+            "not a bare string"
+        )
+
     if extra_clauses:
-        extra_str = " AND ".join(f"({c})" for c in extra_clauses)
+        validated = [_validate_extra_clause(c) for c in extra_clauses]
+        extra_str = " AND ".join(f"({c})" for c in validated)
         base = f"{base} AND {extra_str}"
 
     return base

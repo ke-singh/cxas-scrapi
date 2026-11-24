@@ -35,6 +35,9 @@ def get_verbatim_content_block(
     key: str,
 ) -> str:
     """Deterministic content block lookup."""
+    if not isinstance(catalog, Mapping):
+        raise MissingContentBlock(f"{key}/{brand_id}/{country_code}/{lang}")
+
     attempts = [
         (brand_id, country_code, lang),
         (brand_id, "DEFAULT", lang),
@@ -53,7 +56,7 @@ def get_verbatim_content_block(
         if not isinstance(lang_map, Mapping):
             continue
         val = lang_map.get(key)
-        if val is not None:
+        if isinstance(val, str):
             return val
 
     raise MissingContentBlock(f"{key}/{brand_id}/{country_code}/{lang}")
@@ -68,6 +71,9 @@ def resolve_content_block_or_handoff(
     handoff_reason: str = "missing_statutory_copy",
 ) -> str:
     """Resolves context keys, returning verbatim copy or fail-closed handoff."""
+    if not isinstance(state, MutableMapping):
+        return fallback_utterance
+
     raw_ctx = state.get("context")
     ctx: MutableMapping[str, Any]
     if isinstance(raw_ctx, MutableMapping):

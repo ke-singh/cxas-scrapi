@@ -41,6 +41,20 @@ class BundleDigestMismatchError(PythonBundlerError):
     pass
 
 
+def _assert_safe_subpath(path: Path, root: Path, *, label: str) -> None:
+    """Reject symlinks and paths resolving outside ``root``."""
+    if path.is_symlink():
+        raise PythonBundlerError(
+            f"Symlinks are not permitted in {label}: {path}"
+        )
+    resolved_root = root.resolve()
+    resolved = path.resolve()
+    if resolved != resolved_root and resolved_root not in resolved.parents:
+        raise PythonBundlerError(
+            f"Path escapes {label} root ({resolved_root}): {path}"
+        )
+
+
 def _discover_entrypoints(app_dir: Path) -> list[Path]:
     """Return sorted callback and Python tool entrypoint files in app_dir."""
     entrypoints: list[Path] = []
@@ -84,25 +98,49 @@ def synthesize_python_env_files(
         dest_dir = app_dir
 
     python_lib = app_dir / "python_lib"
+    if python_lib.is_symlink():
+        raise PythonBundlerError(
+            f"Symlinks are not permitted in python_lib: {python_lib}"
+        )
     if not python_lib.is_dir():
-        content_lib = app_dir / "pythonEnvFiles" / "content" / "python_lib"
+        env_dir = app_dir / "pythonEnvFiles"
+        env_content = env_dir / "content"
+        content_lib = env_content / "python_lib"
+        for candidate in (env_dir, env_content, content_lib):
+            if candidate.is_symlink():
+                raise PythonBundlerError(
+                    f"Symlinks are not permitted in python_lib: {candidate}"
+                )
         if not content_lib.is_dir():
             return None
         python_lib = content_lib
+
+    _assert_safe_subpath(python_lib, app_dir, label="python_lib")
 
     python_env_dir = dest_dir / "pythonEnvFiles"
     content_dir = python_env_dir / "content"
     dest_lib = content_dir / "python_lib"
 
     if dest_lib.resolve() != python_lib.resolve():
+        if dest_lib.is_symlink():
+            raise PythonBundlerError(
+                f"Symlinks are not permitted in pythonEnvFiles: {dest_lib}"
+            )
+        if dest_lib.exists():
+            shutil.rmtree(dest_lib)
         dest_lib.mkdir(parents=True, exist_ok=True)
         for root, dirs, files in os.walk(python_lib):
             dirs[:] = sorted(
                 d for d in dirs if d != "__pycache__" and not d.startswith(".")
             )
+            for d in dirs:
+                _assert_safe_subpath(
+                    Path(root) / d, python_lib, label="python_lib"
+                )
             for file in sorted(files):
                 if file.endswith(".py") and not file.startswith("."):
                     src = Path(root) / file
+                    _assert_safe_subpath(src, python_lib, label="python_lib")
                     rel = src.relative_to(python_lib)
                     dst = dest_lib / rel
                     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -113,9 +151,13 @@ def synthesize_python_env_files(
         dirs[:] = sorted(
             d for d in dirs if d != "__pycache__" and not d.startswith(".")
         )
+        for d in dirs:
+            _assert_safe_subpath(Path(root) / d, dest_lib, label="python_lib")
         for file in sorted(files):
             if file.endswith(".py") and not file.startswith("."):
-                py_files.append(Path(root) / file)
+                fpath = Path(root) / file
+                _assert_safe_subpath(fpath, dest_lib, label="python_lib")
+                py_files.append(fpath)
     py_files.sort(key=lambda p: p.relative_to(python_env_dir).as_posix())
 
     manifest_entries: list[dict[str, str]] = []
@@ -170,6 +212,28 @@ def _resolve_relative_base(
     return pkg_parts[: len(pkg_parts) - drop]
 
 
+def _is_type_checking_expr(expr: ast.expr) -> bool:
+    return (isinstance(expr, ast.Name) and expr.id == "TYPE_CHECKING") or (
+        isinstance(expr, ast.Attribute) and expr.attr == "TYPE_CHECKING"
+    )
+
+
+def _is_type_checking_guard(expr: ast.expr) -> bool:
+    if _is_type_checking_expr(expr):
+        return True
+    if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.And):
+        return any(_is_type_checking_guard(v) for v in expr.values)
+    return False
+
+
+def _is_not_type_checking_expr(expr: ast.expr) -> bool:
+    return (
+        isinstance(expr, ast.UnaryOp)
+        and isinstance(expr.op, ast.Not)
+        and _is_type_checking_expr(expr.operand)
+    )
+
+
 def _get_module_dependencies(
     module_name: str, source: str, *, is_package: bool = False
 ) -> set[str]:
@@ -177,7 +241,9 @@ def _get_module_dependencies(
 
     `from pkg import name` records `pkg` AND `pkg.name` (a submodule if it
     exists); relative imports are resolved against `module_name`, which is a
-    package (`__init__.py`) when `is_package` is true.
+    package (`__init__.py`) when `is_package` is true. Imports guarded by
+    `if TYPE_CHECKING:` (or `if typing.TYPE_CHECKING:`) are skipped so
+    type-only imports are not bundled or executed at runtime.
     """
     deps: set[str] = set()
     try:
@@ -185,21 +251,33 @@ def _get_module_dependencies(
     except SyntaxError:
         return deps
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+    class _ImportVisitor(ast.NodeVisitor):
+        def visit_If(self, node: ast.If) -> None:
+            if _is_type_checking_guard(node.test):
+                for stmt in node.orelse:
+                    self.visit(stmt)
+                return
+            if _is_not_type_checking_expr(node.test):
+                for stmt in node.body:
+                    self.visit(stmt)
+                return
+            self.generic_visit(node)
+
+        def visit_Import(self, node: ast.Import) -> None:
             for alias in node.names:
                 deps.add(alias.name)
-        elif isinstance(node, ast.ImportFrom):
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
             if node.level == 0:
                 if not node.module:
-                    continue
+                    return
                 base = node.module.split(".")
             else:
                 prefix = _resolve_relative_base(
                     module_name, node.level, is_package=is_package
                 )
                 if prefix is None:
-                    continue
+                    return
                 base = [
                     *prefix,
                     *(node.module.split(".") if node.module else []),
@@ -209,6 +287,8 @@ def _get_module_dependencies(
             for alias in node.names:
                 if alias.name != "*":
                     deps.add(".".join([*base, alias.name]))
+
+    _ImportVisitor().visit(tree)
     return deps
 
 
@@ -264,6 +344,15 @@ def _bundle_digest(sorted_modules: list[tuple[str, str]]) -> str:
     return hasher.hexdigest()[:16]
 
 
+def _module_digest(module_name: str, source: str) -> str:
+    hasher = hashlib.sha256()
+    hasher.update(module_name.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(source.encode("utf-8"))
+    hasher.update(b"\0")
+    return hasher.hexdigest()[:16]
+
+
 def _module_filename(module_name: str, *, is_package: bool) -> str:
     base = module_name.replace(".", "/")
     return f"{base}/__init__.py" if is_package else f"{base}.py"
@@ -284,47 +373,67 @@ def _render_bundle(
         f'_CXAS_DIGEST = "{digest}"',
     ]
 
-    for m, src in sorted_modules:
-        is_package = m in packages
+    ancestor_packages: set[str] = set(packages)
+    for m, _ in sorted_modules:
         parts = m.split(".")
-        package = m if is_package else ".".join(parts[:-1])
-        bundle_lines.append(
-            f'if getattr(_cxas_sys.modules.get("{m}"), "__cxas_digest__", None) != _CXAS_DIGEST:'  # noqa: E501
-        )
+        for i in range(1, len(parts)):
+            ancestor_packages.add(".".join(parts[:i]))
 
+    ordered_ancestors = sorted(
+        ancestor_packages, key=lambda name: (name.count("."), name)
+    )
+    leaf_modules = [m for m, _ in sorted_modules if m not in ancestor_packages]
+    all_stubs = [*ordered_ancestors, *leaf_modules]
+
+    # Phase 1: Pre-register all package/namespace ancestors (with __path__=[])
+    # and leaf modules without replacing existing module objects, enabling
+    # namespace subpackages, circular imports, and pooled-sandbox sibling
+    # preservation.
+    for m in all_stubs:
+        is_pkg = m in ancestor_packages
+        parts = m.split(".")
+        pkg_name = m if is_pkg else ".".join(parts[:-1])
+        bundle_lines.append(f'_cxas_m = _cxas_sys.modules.get("{m}")')
+        bundle_lines.append("if _cxas_m is None:")
+        bundle_lines.append(f'    _cxas_m = _cxas_types.ModuleType("{m}")')
+        bundle_lines.append(f'    _cxas_sys.modules["{m}"] = _cxas_m')
+        if is_pkg:
+            bundle_lines.append('if not hasattr(_cxas_m, "__path__"):')
+            bundle_lines.append("    _cxas_m.__path__ = []")
+        bundle_lines.append(f'_cxas_m.__package__ = "{pkg_name}"')
         if len(parts) > 1:
             parent = ".".join(parts[:-1])
             bundle_lines.append(
-                f'    _cxas_pkg = _cxas_sys.modules.setdefault("{parent}", _cxas_types.ModuleType("{parent}"))'  # noqa: E501
+                f'setattr(_cxas_sys.modules["{parent}"], "{parts[-1]}", _cxas_m)'  # noqa: E501
             )
-        else:
-            bundle_lines.append("    _cxas_pkg = None")
 
-        bundle_lines.append(f'    _cxas_mod = _cxas_types.ModuleType("{m}")')
-        bundle_lines.append("    _cxas_mod.__cxas_digest__ = _CXAS_DIGEST")
-        bundle_lines.append(f'    _cxas_mod.__package__ = "{package}"')
-        bundle_lines.append(f'    _cxas_sys.modules["{m}"] = _cxas_mod')
-
+    # Phase 2: Execute each bundled module in topological order into its
+    # existing namespace, guarded by its per-module content digest.
+    for m, src in sorted_modules:
+        is_package = m in packages
+        mod_digest = _module_digest(m, src)
         filename = _module_filename(m, is_package=is_package)
+        bundle_lines.append(
+            f'if getattr(_cxas_sys.modules["{m}"], "__cxas_digest__", None) != "{mod_digest}":'  # noqa: E501
+        )
+        bundle_lines.append(f'    _cxas_mod = _cxas_sys.modules["{m}"]')
         bundle_lines.append(
             f'    exec(compile({src!r}, "{filename}", "exec"), _cxas_mod.__dict__)'  # noqa: E501
         )
-
-        if len(parts) > 1:
-            bundle_lines.append(
-                f'    setattr(_cxas_pkg, "{parts[-1]}", _cxas_mod)'
-            )
+        bundle_lines.append(f'    _cxas_mod.__cxas_digest__ = "{mod_digest}"')
 
     bundle_lines.append("# === END CXAS_SHARED_BUNDLE ===")
     return digest, "\n".join(bundle_lines) + "\n"
 
 
-def _bundle_insert_offset(content: str) -> int:
-    """Character offset after the leading `from __future__` imports (else 0)."""
+def _split_for_bundle_insert(content: str) -> tuple[str, str]:
+    """Split ``content`` into ``(head, tail)`` right after leading
+    ``from __future__`` imports, splitting same-line semicolon statements.
+    """
     try:
         tree = ast.parse(content)
     except SyntaxError:
-        return 0
+        return "", content
     last_future: ast.stmt | None = None
     for i, node in enumerate(tree.body):
         if (
@@ -339,9 +448,32 @@ def _bundle_insert_offset(content: str) -> int:
             continue
         break
     if last_future is None or last_future.end_lineno is None:
-        return 0
+        return "", content
+
     lines = content.splitlines(keepends=True)
-    return sum(len(line) for line in lines[: last_future.end_lineno])
+    line_idx = last_future.end_lineno - 1
+    before_lines = "".join(lines[:line_idx])
+    stmt_line = lines[line_idx]
+
+    end_col = last_future.end_col_offset
+    if end_col is not None:
+        stmt_bytes = stmt_line.encode("utf-8")
+        prefix_part = stmt_bytes[:end_col].decode("utf-8")
+        rest_part = stmt_bytes[end_col:].decode("utf-8")
+        stripped_rest = rest_part.lstrip(" \t")
+        if stripped_rest.startswith(";"):
+            after_semi = stripped_rest[1:].lstrip(" \t")
+            after_lines = "".join(lines[line_idx + 1 :])
+            if after_semi and not after_semi.startswith(("\n", "\r", "#")):
+                return before_lines + prefix_part + "\n", (
+                    after_semi + after_lines
+                )
+
+    offset = sum(len(line) for line in lines[: last_future.end_lineno])
+    head, tail = content[:offset], content[offset:]
+    if head and not head.endswith("\n"):
+        head += "\n"
+    return head, tail
 
 
 def bundle_shared_python(
@@ -355,15 +487,30 @@ def bundle_shared_python(
 
     Inserts one `CXAS_SHARED_BUNDLE` block per entrypoint without touching any
     other byte of the entrypoint, so `strip_shared_bundles` restores it exactly.
-    Raises `PythonBundlerError` if a bundled shared module is not valid Python.
+    Raises `PythonBundlerError` if a bundled shared module or entrypoint is not
+    valid UTF-8 Python or contains symlinks.
     """
     if source_root is None:
         source_root = app_dir
 
     search_paths: list[Path] = []
-    if (source_root / "pythonEnvFiles" / "content").is_dir():
-        search_paths.append(source_root / "pythonEnvFiles" / "content")
-    if (source_root / "python_lib").is_dir():
+    env_dir = source_root / "pythonEnvFiles"
+    env_content = env_dir / "content"
+    env_plib = env_content / "python_lib"
+    for candidate in (env_dir, env_content, env_plib):
+        if candidate.is_symlink():
+            raise PythonBundlerError(
+                f"Symlinks are not permitted in python_lib: {candidate}"
+            )
+    if env_content.is_dir():
+        search_paths.append(env_content)
+
+    direct_plib = source_root / "python_lib"
+    if direct_plib.is_symlink():
+        raise PythonBundlerError(
+            f"Symlinks are not permitted in python_lib: {direct_plib}"
+        )
+    if direct_plib.is_dir():
         search_paths.append(source_root)
 
     available_modules: dict[str, str] = {}
@@ -371,23 +518,37 @@ def bundle_shared_python(
     packages: set[str] = set()
     for sp in search_paths:
         plib = sp / "python_lib"
+        if plib.is_symlink():
+            raise PythonBundlerError(
+                f"Symlinks are not permitted in python_lib: {plib}"
+            )
         if not plib.is_dir():
             continue
+        _assert_safe_subpath(plib, source_root, label="python_lib")
         for root, dirs, files in os.walk(plib):
             dirs[:] = sorted(
                 d for d in dirs if d != "__pycache__" and not d.startswith(".")
             )
+            for d in dirs:
+                _assert_safe_subpath(Path(root) / d, plib, label="python_lib")
             for file in sorted(files):
                 if file.endswith(".py") and not file.startswith("."):
                     path = Path(root) / file
+                    _assert_safe_subpath(path, plib, label="python_lib")
                     rel = path.relative_to(sp).as_posix()
                     mod_name = rel.replace("/", ".")[:-3]
                     if mod_name.endswith(".__init__"):
                         mod_name = mod_name[:-9]
                         packages.add(mod_name)
-                    available_modules[mod_name] = path.read_text(
-                        encoding="utf-8"
-                    )
+                    try:
+                        available_modules[mod_name] = path.read_text(
+                            encoding="utf-8"
+                        )
+                    except UnicodeDecodeError as exc:
+                        raise PythonBundlerError(
+                            f"Shared module {mod_name} ({path}) is not valid "
+                            f"UTF-8: {exc}"
+                        ) from exc
                     module_paths[mod_name] = path
 
     entrypoints = _discover_entrypoints(app_dir)
@@ -400,7 +561,13 @@ def bundle_shared_python(
     )
 
     for ep in entrypoints:
-        original = ep.read_text(encoding="utf-8")
+        _assert_safe_subpath(ep, app_dir, label="app_dir")
+        try:
+            original = ep.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise PythonBundlerError(
+                f"Entrypoint {ep} is not valid UTF-8: {exc}"
+            ) from exc
         content = marker_begin_regex.sub("", original)
 
         if native_python_env:
@@ -408,6 +575,13 @@ def bundle_shared_python(
                 ep.write_text(content, encoding="utf-8")
             results[str(ep)] = 0
             continue
+
+        try:
+            ast.parse(content, filename=str(ep))
+        except SyntaxError as exc:
+            raise PythonBundlerError(
+                f"Entrypoint {ep} is not valid Python: {exc}"
+            ) from exc
 
         deps = _get_module_dependencies("entrypoint", content)
         closure: set[str] = set()
@@ -451,10 +625,7 @@ def bundle_shared_python(
                 f"Bundle for {ep} exceeded {max_bundle_bytes} bytes"
             )
 
-        offset = _bundle_insert_offset(content)
-        head, tail = content[:offset], content[offset:]
-        if head and not head.endswith("\n"):
-            head += "\n"
+        head, tail = _split_for_bundle_insert(content)
         ep.write_text(head + bundle_text + tail, encoding="utf-8")
         results[str(ep)] = len(bundle_text.encode("utf-8"))
 
@@ -550,8 +721,21 @@ def _local_module_source(local_source_dir: Path, module: str) -> str | None:
         local_source_dir / "pythonEnvFiles" / "content",
     ):
         for candidate in (root / f"{rel}.py", root / rel / "__init__.py"):
+            if candidate.is_symlink():
+                raise PythonBundlerError(
+                    f"Symlinks are not permitted in python_lib: {candidate}"
+                )
             if candidate.is_file():
-                return candidate.read_text(encoding="utf-8")
+                _assert_safe_subpath(
+                    candidate, local_source_dir, label="python_lib"
+                )
+                try:
+                    return candidate.read_text(encoding="utf-8")
+                except UnicodeDecodeError as exc:
+                    raise PythonBundlerError(
+                        f"Shared module {module} ({candidate}) is not valid "
+                        f"UTF-8: {exc}"
+                    ) from exc
     return None
 
 
@@ -582,7 +766,12 @@ def strip_shared_bundles(
 
     stripped: list[Path] = []
     for ep in entrypoints:
-        content = ep.read_text(encoding="utf-8")
+        try:
+            content = ep.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise PythonBundlerError(
+                f"Entrypoint {ep} is not valid UTF-8: {exc}"
+            ) from exc
         matches = list(marker_regex.finditer(content))
         if not matches:
             if not force and any_marker_regex.search(content):

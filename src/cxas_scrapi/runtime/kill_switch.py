@@ -28,13 +28,13 @@ def check_disabled_agent(
     state: Mapping[str, Any], agent_name: str, *, fallback_message: str
 ) -> dict[str, Any] | None:
     """Checks disabled_agents and returns short-circuit response if disabled."""
-    raw_ctx = state.get("context")
+    raw_ctx = state.get("context") if isinstance(state, Mapping) else None
     ctx = raw_ctx if isinstance(raw_ctx, Mapping) else {}
     disabled = ctx.get("disabled_agents")
 
     disabled_set: set[str] = set()
     if disabled:
-        if isinstance(disabled, (list, set, tuple)):
+        if isinstance(disabled, (list, set, frozenset, tuple)):
             disabled_set = {str(x) for x in disabled}
         elif isinstance(disabled, str):
             try:

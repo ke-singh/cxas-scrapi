@@ -27,7 +27,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from cxas_scrapi.core.apps import Apps
+from cxas_scrapi.core.apps import Apps, validate_zip_entry_name
 from cxas_scrapi.core.common import Common
 from cxas_scrapi.core.python_bundler import strip_shared_bundles
 from cxas_scrapi.core.versions import Versions
@@ -209,14 +209,14 @@ def _app_pull(
         lro = apps_client.export_app(app_name=app_name, app_version=app_version)
         response = lro.result()
 
-        # Determine the target directory
-        if not os.path.exists(target_dir):
-            os.makedirs(target_dir)
-
-        # Extract content to target directory.
+        # Validate archive entries and extract into a staging directory first
+        # so Zip-Slip or bundle-strip failures never overwrite local files.
         top_dir = ""
         with zipfile.ZipFile(io.BytesIO(response.app_content)) as z:
             export_members = list(z.namelist())
+            for info in z.infolist():
+                validate_zip_entry_name(info.filename)
+
             if export_members:
                 first_part = export_members[0].split("/")[0]
                 has_top_dir = (
@@ -248,34 +248,85 @@ def _app_pull(
                 except (OSError, ValueError):
                     prev_env_defaults = {}
 
-            if dest_app_root is not None:
-                os.makedirs(dest_app_root, exist_ok=True)
-                abs_dest_root = os.path.abspath(dest_app_root)
-                prefix = f"{top_dir}/" if top_dir else ""
-                for info in z.infolist():
-                    rel_name = info.filename
-                    if top_dir:
-                        if rel_name in (top_dir, prefix):
+            with tempfile.TemporaryDirectory() as stage_dir:
+                if dest_app_root is not None:
+                    staged_app_root = os.path.join(stage_dir, "app")
+                    os.makedirs(staged_app_root, exist_ok=True)
+                    abs_stage_root = os.path.abspath(staged_app_root)
+                    prefix = f"{top_dir}/" if top_dir else ""
+                    for info in z.infolist():
+                        rel_name = info.filename
+                        if top_dir:
+                            if rel_name in (top_dir, prefix):
+                                continue
+                            if rel_name.startswith(prefix):
+                                rel_name = rel_name[len(prefix) :]
+                        if not rel_name:
                             continue
-                        if rel_name.startswith(prefix):
-                            rel_name = rel_name[len(prefix) :]
-                    if not rel_name:
-                        continue
-                    target_member_path = os.path.abspath(
-                        os.path.join(dest_app_root, rel_name)
-                    )
-                    if (
-                        os.path.commonpath([abs_dest_root, target_member_path])
-                        != abs_dest_root
-                    ):
-                        raise ValueError(
-                            "Path traversal detected in archive entry: "
-                            f"{info.filename}"
+                        target_member_path = os.path.abspath(
+                            os.path.join(staged_app_root, rel_name)
                         )
-                    info.filename = rel_name
-                    z.extract(info, path=dest_app_root)
-            else:
-                z.extractall(target_dir)
+                        if (
+                            os.path.commonpath(
+                                [abs_stage_root, target_member_path]
+                            )
+                            != abs_stage_root
+                        ):
+                            raise ValueError(
+                                "Path traversal detected in archive entry: "
+                                f"{info.filename}"
+                            )
+                        info.filename = rel_name
+                        z.extract(info, path=staged_app_root)
+                else:
+                    abs_stage_dir = os.path.abspath(stage_dir)
+                    for info in z.infolist():
+                        target_member_path = os.path.abspath(
+                            os.path.join(stage_dir, info.filename)
+                        )
+                        if (
+                            os.path.commonpath(
+                                [abs_stage_dir, target_member_path]
+                            )
+                            != abs_stage_dir
+                        ):
+                            raise ValueError(
+                                "Path traversal detected in archive entry: "
+                                f"{info.filename}"
+                            )
+                    z.extractall(stage_dir)
+                    staged_app_root = (
+                        os.path.join(stage_dir, top_dir)
+                        if top_dir
+                        else stage_dir
+                    )
+
+                force_strip = getattr(args, "force", False) if args else False
+                has_local_lib = os.path.isdir(
+                    os.path.join(pulled_app_root, "python_lib")
+                ) or os.path.isdir(
+                    os.path.join(
+                        pulled_app_root,
+                        "pythonEnvFiles",
+                        "content",
+                        "python_lib",
+                    )
+                )
+                strip_shared_bundles(
+                    Path(staged_app_root),
+                    local_source_dir=(
+                        Path(pulled_app_root)
+                        if has_local_lib
+                        else Path(staged_app_root)
+                    ),
+                    force=force_strip,
+                )
+
+                os.makedirs(target_dir, exist_ok=True)
+                os.makedirs(pulled_app_root, exist_ok=True)
+                shutil.copytree(
+                    staged_app_root, pulled_app_root, dirs_exist_ok=True
+                )
 
         # Handle overwrite logic if requested. Pruning is scoped to a dedicated
         # app folder (the archive's top-level folder or --app-dir-name) so a
@@ -352,9 +403,6 @@ def _app_pull(
                                     f"{dir_path}"
                                 )
                                 os.rmdir(dir_path)
-
-        force_strip = getattr(args, "force", False) if args else False
-        strip_shared_bundles(Path(pulled_app_root), force=force_strip)
 
         if prev_env_vars:
             preserved = preserve_env_var_placeholders_on_pull(
