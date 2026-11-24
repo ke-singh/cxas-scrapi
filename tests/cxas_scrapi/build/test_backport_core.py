@@ -158,7 +158,7 @@ def _make_core_repo(
         "instruction": "agents/root_agent/instruction.txt",
         "tools": root_tools,
         "childAgents": ["web_helper"],
-        "modelSettings": {"model": "gemini-2.5-flash", "temperature": 0.3},
+        "modelSettings": {"model": "gemini-3.0-flash", "temperature": 0.3},
     }
     if with_python_lib:
         root_cfg["beforeModelCallbacks"] = [
@@ -197,7 +197,7 @@ def _make_core_repo(
             "description": "Web-only helper for @@brand.display_name@@.",
             "instruction": "agents/web_helper/instruction.txt",
             "tools": ["kb_search"],
-            "modelSettings": {"model": "gemini-2.5-flash", "temperature": 0.2},
+            "modelSettings": {"model": "gemini-3.0-flash", "temperature": 0.2},
         },
     )
     (core / "agents" / "web_helper" / "instruction.txt").write_text(
