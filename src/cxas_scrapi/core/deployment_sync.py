@@ -27,11 +27,16 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtoMessage
+
+from cxas_scrapi.core.deployments import Deployments
+
+if TYPE_CHECKING:
+    from enum import Enum
 
 _VOLATILE_DEPLOYMENT_KEYS = frozenset(
     {"name", "createTime", "updateTime", "etag"}
@@ -299,6 +304,31 @@ def export_deployments_to_dir(
     return written
 
 
+def _resolve_enum_member_name(
+    enum_cls: type[Enum],
+    raw_value: Any,
+    *,
+    field_label: str,
+    path: Path,
+) -> str:
+    """Resolve an enum string by member name OR wire value (e.g. proto enum)."""
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise ValueError(f"{path}: {field_label} must be a non-empty string.")
+    upper = raw_value.strip().upper()
+    member = enum_cls.__members__.get(upper)
+    if member is not None:
+        return member.name
+    for cand in enum_cls:
+        if isinstance(cand.value, str) and cand.value.upper() == upper:
+            return cand.name
+    valid = sorted(
+        {m.name for m in enum_cls} | {str(m.value) for m in enum_cls}
+    )
+    raise ValueError(
+        f"{path}: invalid {field_label} {raw_value!r}; expected one of {valid}."
+    )
+
+
 def _normalize_app_version(app_version: str, app_name: str | None) -> str:
     """Expand a bare version ID when ``app_name`` is set."""
     if app_version and not app_version.startswith("projects/") and app_name:
@@ -355,12 +385,12 @@ def _parse_deployment_yaml_file(
         if not isinstance(cp, dict):
             raise ValueError(f"{path}: channelProfile must be a mapping.")
         if "channelType" in cp and cp["channelType"] is not None:
-            ct = cp["channelType"]
-            if not isinstance(ct, str) or not ct.strip():
-                raise ValueError(
-                    f"{path}: channelProfile.channelType must be a string."
-                )
-            fields["channel_type"] = ct
+            fields["channel_type"] = _resolve_enum_member_name(
+                Deployments.ChannelType,
+                cp["channelType"],
+                field_label="channelProfile.channelType",
+                path=path,
+            )
         if "disableDtmf" in cp and cp["disableDtmf"] is not None:
             if not isinstance(cp["disableDtmf"], bool):
                 raise ValueError(
@@ -387,19 +417,31 @@ def _parse_deployment_yaml_file(
                     f"{path}: channelProfile.noiseSuppressionLevel must be a "
                     "non-empty string."
                 )
-            fields["noise_suppression_level"] = nsl
+            nsl_norm = nsl.strip().lower()
+            if nsl_norm not in Deployments.VALID_NOISE_SUPPRESSION_LEVELS:
+                raise ValueError(
+                    f"{path}: invalid channelProfile.noiseSuppressionLevel "
+                    f"{nsl!r}; expected one of "
+                    f"{list(Deployments.VALID_NOISE_SUPPRESSION_LEVELS)}."
+                )
+            fields["noise_suppression_level"] = nsl_norm
         if "personaProperty" in cp and cp["personaProperty"] is not None:
             pp = cp["personaProperty"]
             if isinstance(pp, dict):
                 persona_val = pp.get("persona")
-                if not isinstance(persona_val, str) or not persona_val.strip():
-                    raise ValueError(
-                        f"{path}: channelProfile.personaProperty.persona must "
-                        "be a non-empty string."
-                    )
-                fields["persona_property"] = persona_val
+                fields["persona_property"] = _resolve_enum_member_name(
+                    Deployments.Persona,
+                    persona_val,
+                    field_label="channelProfile.personaProperty.persona",
+                    path=path,
+                )
             elif isinstance(pp, str) and pp.strip():
-                fields["persona_property"] = pp
+                fields["persona_property"] = _resolve_enum_member_name(
+                    Deployments.Persona,
+                    pp,
+                    field_label="channelProfile.personaProperty",
+                    path=path,
+                )
             else:
                 raise ValueError(
                     f"{path}: channelProfile.personaProperty must be a string "
@@ -412,17 +454,19 @@ def _parse_deployment_yaml_file(
                     f"{path}: channelProfile.webWidgetConfig must be a mapping."
                 )
             if "modality" in wwc and wwc["modality"] is not None:
-                if not isinstance(wwc["modality"], str):
-                    raise ValueError(
-                        f"{path}: webWidgetConfig.modality must be a string."
-                    )
-                fields["modality"] = wwc["modality"]
+                fields["modality"] = _resolve_enum_member_name(
+                    Deployments.Modality,
+                    wwc["modality"],
+                    field_label="webWidgetConfig.modality",
+                    path=path,
+                )
             if "theme" in wwc and wwc["theme"] is not None:
-                if not isinstance(wwc["theme"], str):
-                    raise ValueError(
-                        f"{path}: webWidgetConfig.theme must be a string."
-                    )
-                fields["theme"] = wwc["theme"]
+                fields["theme"] = _resolve_enum_member_name(
+                    Deployments.Theme,
+                    wwc["theme"],
+                    field_label="webWidgetConfig.theme",
+                    path=path,
+                )
             if "webWidgetTitle" in wwc and wwc["webWidgetTitle"] is not None:
                 if not isinstance(wwc["webWidgetTitle"], str):
                     raise ValueError(
@@ -461,15 +505,33 @@ def _parse_deployment_yaml_file(
                             f"{path}: trafficAllocation.appVersion must be a "
                             "non-empty string."
                         )
-                    if isinstance(a_pct, bool) or not isinstance(a_pct, int):
+                    if (
+                        isinstance(a_pct, bool)
+                        or not isinstance(a_pct, int)
+                        or not (0 <= a_pct <= 100)
+                    ):
                         raise ValueError(
                             f"{path}: trafficAllocation.trafficPercentage must "
-                            "be an integer."
+                            "be an integer in [0, 100]."
                         )
-                    traffic_split[_normalize_app_version(a_ver, app_name)] = (
-                        a_pct
-                    )
+                    norm_ver = _normalize_app_version(a_ver, app_name)
+                    if norm_ver in traffic_split:
+                        raise ValueError(
+                            f"{path}: duplicate appVersion {norm_ver!r} in "
+                            "trafficAllocations."
+                        )
+                    traffic_split[norm_ver] = a_pct
                 if traffic_split:
+                    if len(traffic_split) < 2:
+                        raise ValueError(
+                            f"{path}: trafficAllocations requires at least two "
+                            "distinct app versions."
+                        )
+                    if sum(traffic_split.values()) != 100:
+                        raise ValueError(
+                            f"{path}: trafficAllocations percentages must sum "
+                            f"to 100 (got {sum(traffic_split.values())})."
+                        )
                     fields["traffic_split"] = traffic_split
 
     return dep_id, fields

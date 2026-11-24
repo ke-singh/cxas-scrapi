@@ -1159,6 +1159,19 @@ def _copy_template_traversable(src_node: Any, dest: Path, root: Path) -> None:
         dest.write_bytes(src_node.read_bytes())
 
 
+def _validate_template_dest_tree(src_node: Any, dest: Path, root: Path) -> None:
+    """Recursively verify destination paths have no symlinks or escapes."""
+    _assert_safe_init_dest(dest, root)
+    if src_node.is_dir() and dest.is_dir():
+        for child in sorted(src_node.iterdir(), key=lambda c: c.name):
+            if child.name in (
+                "__pycache__",
+                ".DS_Store",
+            ) or child.name.endswith(".pyc"):
+                continue
+            _validate_template_dest_tree(child, dest / child.name, root)
+
+
 def _init_multibrand_template(
     target_dir: Path, *, force: bool, no_input: bool
 ) -> None:
@@ -1176,34 +1189,51 @@ def _init_multibrand_template(
         )
         sys.exit(1)
 
-    target_dir.mkdir(parents=True, exist_ok=True)
-    overwrite_all = force
-    copied, skipped = 0, 0
+    entries = [
+        item
+        for item in sorted(template_root.iterdir(), key=lambda c: c.name)
+        if item.name not in ("__pycache__", ".DS_Store")
+        and not item.name.endswith(".pyc")
+    ]
 
-    for item in sorted(template_root.iterdir(), key=lambda c: c.name):
-        if item.name in ("__pycache__", ".DS_Store") or item.name.endswith(
-            ".pyc"
-        ):
-            continue
+    # Phase 1a: Validate ALL destination paths for symlinks/escapes before
+    # creating directories or writing any files on disk.
+    for item in entries:
         dest = target_dir / item.name
         try:
-            _assert_safe_init_dest(dest, target_dir)
+            _validate_template_dest_tree(item, dest, target_dir)
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
 
+    # Phase 1b: Resolve ALL overwrite checks/prompts before writing anything.
+    overwrite_all = force
+    plan: list[tuple[Any, Path, bool]] = []
+    for item in entries:
+        dest = target_dir / item.name
         if dest.exists() and not overwrite_all:
             choice = _prompt_overwrite(item.name, no_input)
             if choice == "abort":
                 print("Aborted.")
                 sys.exit(0)
-            elif choice == "all":
+            if choice == "all":
                 overwrite_all = True
+                plan.append((item, dest, True))
             elif choice == "skip":
-                skipped += 1
-                print(f"  Skipped: {item.name}")
-                continue
+                plan.append((item, dest, False))
+            else:
+                plan.append((item, dest, True))
+        else:
+            plan.append((item, dest, True))
 
+    # Phase 2: Apply the pre-validated write plan.
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied, skipped = 0, 0
+    for item, dest, should_write in plan:
+        if not should_write:
+            skipped += 1
+            print(f"  Skipped: {item.name}")
+            continue
         try:
             if item.is_dir():
                 if dest.exists():

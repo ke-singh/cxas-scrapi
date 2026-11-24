@@ -20,6 +20,7 @@ import ast
 import contextlib
 import copy
 import difflib
+import io
 import json
 import math
 import os
@@ -29,6 +30,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -42,6 +44,7 @@ from cxas_scrapi.build.builder import (
     _build_identity_block,
     _paths_overlap,
     _render_env_template,
+    _render_python_source,
     _validate_tree_no_symlinks,
     build_all,
     build_app,
@@ -108,6 +111,8 @@ _COND_INLINE_RE = re.compile(
     r"\{@end\1_\2\}"
 )
 _TOOL_PAYLOAD_KEYS = ("openApiTool", "dataStoreTool", "pythonFunction")
+_PY_STR_PREFIX_RE = re.compile(r"^([rRuUbBfF]*)('''|\"\"\"|'|\")")
+_FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", None)
 
 
 class _CleanYamlDumper(yaml.SafeDumper):
@@ -996,6 +1001,63 @@ def _check_python_bundle_and_extra_files(
     return changed_py_files
 
 
+def _reverse_tokens_in_python_strings(
+    clean_py: str,
+    rev_pairs: Sequence[tuple[str, str]],
+    svc_patterns: Sequence[tuple[re.Pattern[str], str]],
+    render_fn: Callable[[str], str],
+) -> str:
+    """Reverse-tokenize only Python string literals, never identifiers."""
+    lines = clean_py.splitlines(keepends=True)
+    line_offsets: list[int] = [0]
+    for ln in lines:
+        line_offsets.append(line_offsets[-1] + len(ln))
+
+    def _to_offset(pos: tuple[int, int]) -> int:
+        row, col = pos
+        return line_offsets[row - 1] + col
+
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(clean_py).readline))
+    except (tokenize.TokenError, IndentationError):
+        return clean_py
+
+    edits: list[tuple[int, int, str]] = []
+    for tok in tokens:
+        if tok.type == tokenize.STRING:
+            m = _PY_STR_PREFIX_RE.match(tok.string)
+            if not m:
+                continue
+            prefix, quote = m.group(1), m.group(2)
+            if "b" in prefix.lower():
+                continue
+            body = tok.string[len(prefix) + len(quote) : -len(quote)]
+            new_body = _reverse_tokens(body, rev_pairs, svc_patterns, render_fn)
+            if new_body != body:
+                edits.append(
+                    (
+                        _to_offset(tok.start),
+                        _to_offset(tok.end),
+                        f"{prefix}{quote}{new_body}{quote}",
+                    )
+                )
+        elif _FSTRING_MIDDLE is not None and tok.type == _FSTRING_MIDDLE:
+            new_seg = _reverse_tokens(
+                tok.string, rev_pairs, svc_patterns, render_fn
+            )
+            if new_seg != tok.string:
+                edits.append(
+                    (_to_offset(tok.start), _to_offset(tok.end), new_seg)
+                )
+
+    if not edits:
+        return clean_py
+    result = clean_py
+    for start_off, end_off, replacement in reversed(edits):
+        result = result[:start_off] + replacement + result[end_off:]
+    return result
+
+
 def _reverse_python_code_safely(
     raw_py: str,
     py_path: Path,
@@ -1020,13 +1082,27 @@ def _reverse_python_code_safely(
             f"Cannot backport invalid Python syntax in {py_path}: {exc}"
         ) from exc
 
-    cand_py = _reverse_tokens(clean_py, rev_pairs, svc_patterns, render_fn)
+    cand_py = _reverse_tokens_in_python_strings(
+        clean_py, rev_pairs, svc_patterns, render_fn
+    )
+    if cand_py == clean_py:
+        return clean_py
+
+    try:
+        rendered_source = _render_python_source(
+            cand_py, py_path, lambda s: s, render_fn
+        )
+    except BuildError:
+        return clean_py
+    if rendered_source != clean_py:
+        return clean_py
+
     for b_id, pol in manifests.policies.items():
         for ch in pol.channels:
             r_fn = _make_token_renderer(manifests, b_id, ch, environment)
             try:
-                ast.parse(r_fn(cand_py))
-            except SyntaxError:
+                _render_python_source(cand_py, py_path, lambda s: s, r_fn)
+            except BuildError:
                 return clean_py
     return cand_py
 
@@ -1081,6 +1157,100 @@ def _analyze_inline_conditionals(
     return "none", []
 
 
+def _eval_inline_conditionals_line(
+    r_line: str, eval_fn: Callable[[str, str], bool]
+) -> str:
+    """Evaluate inline `{@start...}...{@end...}` blocks on one raw line."""
+    cur = r_line
+    while "{@start" in cur:
+        nxt = _COND_INLINE_RE.sub(
+            lambda m: m.group(3) if eval_fn(m.group(1), m.group(2)) else "",
+            cur,
+        )
+        if nxt == cur:
+            break
+        cur = nxt
+    return cur
+
+
+def _align_raw_lines_to_base_spans(
+    emit_to_raw_line: Sequence[str],
+    base_split: Sequence[str],
+    *,
+    eval_fn: Callable[[str, str], bool],
+    render_fn: Callable[[str], str] | None = None,
+) -> list[tuple[int, int]] | None:
+    """Map each emitted raw line to a contiguous `[start, end)` base span."""
+    n_raw = len(emit_to_raw_line)
+    n_base = len(base_split)
+    if n_raw == n_base:
+        return [(i, i + 1) for i in range(n_raw)]
+    if n_raw == 0 or n_base == 0:
+        return None
+
+    # 1. Exact alignment using `render_fn` when available (handles any
+    # combination of single-line and multi-line token expansions cleanly).
+    if render_fn is not None:
+        spans: list[tuple[int, int]] = []
+        cursor = 0
+        matched = True
+        for r_line in emit_to_raw_line:
+            rendered = render_fn(
+                _eval_inline_conditionals_line(r_line, eval_fn)
+            ).replace("\r\n", "\n")
+            parts = rendered.split("\n")
+            end = cursor + len(parts)
+            if end > n_base or list(base_split[cursor:end]) != parts:
+                matched = False
+                break
+            spans.append((cursor, end))
+            cursor = end
+        if matched and cursor == n_base:
+            return spans
+
+    # 2. Structural anchor alignment without `render_fn`: literal lines match
+    # 1:1 while a single raw line containing a multi-line token maps to its
+    # expanded `base_split` slice.
+    eval_raw = [
+        _eval_inline_conditionals_line(ln, eval_fn) for ln in emit_to_raw_line
+    ]
+    opcodes = difflib.SequenceMatcher(
+        None, eval_raw, list(base_split), autojunk=False
+    ).get_opcodes()
+    spans_by_raw: list[tuple[int, int] | None] = [None] * n_raw
+    for tag, ri1, ri2, bi1, bi2 in opcodes:
+        if tag == "equal":
+            for k in range(ri2 - ri1):
+                spans_by_raw[ri1 + k] = (bi1 + k, bi1 + k + 1)
+        elif tag == "replace":
+            r_len = ri2 - ri1
+            b_len = bi2 - bi1
+            if r_len == 1 and b_len >= 1:
+                spans_by_raw[ri1] = (bi1, bi2)
+            elif r_len == b_len:
+                for k in range(r_len):
+                    spans_by_raw[ri1 + k] = (bi1 + k, bi1 + k + 1)
+            else:
+                return None
+        else:
+            return None
+
+    if any(s is None for s in spans_by_raw):
+        return None
+    resolved = [s for s in spans_by_raw if s is not None]
+    if (
+        resolved[0][0] != 0
+        or resolved[-1][1] != n_base
+        or any(b_e <= b_s for b_s, b_e in resolved)
+        or any(
+            resolved[i][1] != resolved[i + 1][0]
+            for i in range(len(resolved) - 1)
+        )
+    ):
+        return None
+    return resolved
+
+
 def _patch_core_instruction_preserving_conditionals(
     raw_core_text: str,
     base_built_text: str,
@@ -1091,8 +1261,9 @@ def _patch_core_instruction_preserving_conditionals(
     disabled_agents: set[str],
     disabled_tools: set[str],
     rev_fn: Callable[[str], str],
+    render_fn: Callable[[str], str] | None = None,
 ) -> str:
-    """Patch a `core/` prompt while keeping inactive `{@start...}` blocks."""
+    """Patch a `core/` prompt while keeping active and inactive conditionals."""
 
     def _eval_cond(kind: str, arg: str) -> bool:
         if kind == "Channel":
@@ -1114,6 +1285,7 @@ def _patch_core_instruction_preserving_conditionals(
     emit_to_raw_line: list[str] = []
     pending_struct: list[str] = []
     stack: list[tuple[str, str, bool]] = []
+    has_active_cond = False
 
     for r_line in raw_lines:
         stripped = r_line.strip()
@@ -1121,6 +1293,8 @@ def _patch_core_instruction_preserving_conditionals(
         if m_s:
             k, a = m_s.group(1), m_s.group(2)
             active = _eval_cond(k, a)
+            if active and all(item[2] for item in stack):
+                has_active_cond = True
             stack.append((k, a, active))
             pending_struct.append(r_line)
             continue
@@ -1131,6 +1305,10 @@ def _patch_core_instruction_preserving_conditionals(
             pending_struct.append(r_line)
             continue
         if all(item[2] for item in stack):
+            if "{@start" in r_line:
+                for m_inl in _COND_INLINE_RE.finditer(r_line):
+                    if _eval_cond(m_inl.group(1), m_inl.group(2)):
+                        has_active_cond = True
             emit_idx = len(emit_to_raw_line)
             if pending_struct:
                 pre_interstitial[emit_idx] = list(pending_struct)
@@ -1154,20 +1332,66 @@ def _patch_core_instruction_preserving_conditionals(
             tail_pre = pre_interstitial.pop(last_idx, [])
             trailing_struct = [*tail_pre, *tail_exp, *trailing_struct]
 
-    if len(emit_to_raw_line) == len(base_split):
-        out_raw: list[str] = []
+    raw_spans = _align_raw_lines_to_base_spans(
+        emit_to_raw_line,
+        base_split,
+        eval_fn=_eval_cond,
+        render_fn=render_fn,
+    )
+    if raw_spans is not None:
+        base_to_raw: list[int] = [-1] * len(base_split)
+        raw_bounds: dict[int, int] = {len(base_split): len(raw_spans)}
+        for r_idx, (b_s, b_e) in enumerate(raw_spans):
+            raw_bounds[b_s] = r_idx
+            for b_i in range(b_s, b_e):
+                base_to_raw[b_i] = r_idx
+
         opcodes = difflib.SequenceMatcher(
             None, base_split, live_split, autojunk=False
         ).get_opcodes()
-        for tag, i1, i2, j1, j2 in opcodes:
+        base_to_live: dict[int, int] = {}
+        dirty_raw = [False] * len(raw_spans)
+        for tag, i1, i2, j1, _j2 in opcodes:
             if tag == "equal":
-                for idx in range(i1, i2):
-                    out_raw.extend(pre_interstitial.get(idx, ()))
-                    out_raw.append(emit_to_raw_line[idx])
+                for k in range(i2 - i1):
+                    base_to_live[i1 + k] = j1 + k
             elif tag in ("replace", "delete"):
-                for idx in range(i1, i2):
-                    out_raw.extend(pre_interstitial.get(idx, ()))
-                    r_ln = emit_to_raw_line[idx]
+                for b_i in range(i1, i2):
+                    dirty_raw[base_to_raw[b_i]] = True
+            elif tag == "insert" and i1 not in raw_bounds:
+                dirty_raw[base_to_raw[i1]] = True
+
+        out_raw: list[str] = []
+        live_cursor = 0
+        r_idx = 0
+        n_raw = len(raw_spans)
+        while r_idx < n_raw:
+            if not dirty_raw[r_idx]:
+                b_s, b_e = raw_spans[r_idx]
+                l_s = base_to_live[b_s]
+                l_e = base_to_live[b_e - 1] + 1
+                if live_cursor < l_s:
+                    if r_idx in pre_interstitial:
+                        out_raw.extend(pre_interstitial.pop(r_idx))
+                    for l_ln in live_split[live_cursor:l_s]:
+                        out_raw.append(rev_fn(l_ln))
+                out_raw.extend(pre_interstitial.get(r_idx, ()))
+                out_raw.append(emit_to_raw_line[r_idx])
+                live_cursor = l_e
+                r_idx += 1
+            else:
+                r_start = r_idx
+                while r_idx < n_raw and dirty_raw[r_idx]:
+                    r_idx += 1
+                r_end = r_idx
+                live_end = (
+                    base_to_live[raw_spans[r_end][0]]
+                    if r_end < n_raw
+                    else len(live_split)
+                )
+                for d_idx in range(r_start, r_end):
+                    out_raw.extend(pre_interstitial.get(d_idx, ()))
+                    r_ln = emit_to_raw_line[d_idx]
                     inl_kind, inl_exp = _analyze_inline_conditionals(
                         r_ln, _eval_cond
                     )
@@ -1180,16 +1404,22 @@ def _patch_core_instruction_preserving_conditionals(
                             f"conditional ({r_ln.strip()!r}); edit this line "
                             "in core/ directly."
                         )
-                if tag == "replace":
-                    for l_ln in live_split[j1:j2]:
-                        out_raw.append(rev_fn(l_ln))
-            elif tag == "insert":
-                if i1 < len(emit_to_raw_line) and i1 in pre_interstitial:
-                    out_raw.extend(pre_interstitial.pop(i1))
-                for l_ln in live_split[j1:j2]:
+                for l_ln in live_split[live_cursor:live_end]:
                     out_raw.append(rev_fn(l_ln))
+                live_cursor = live_end
+
+        if live_cursor < len(live_split):
+            for l_ln in live_split[live_cursor:]:
+                out_raw.append(rev_fn(l_ln))
         out_raw.extend(trailing_struct)
         return "\n".join(out_raw) + ("\n" if out_raw else "")
+
+    if has_active_cond:
+        raise BuildGateError(
+            "Cannot safely preserve active conditional block(s) during "
+            "--target core backport because line alignment failed; edit "
+            "this file in core/ directly."
+        )
 
     preserved_inactive: list[str] = []
     inact_stack: list[bool] = []
@@ -2016,6 +2246,14 @@ def _apply_core_target_backport(
                             for part in ln.split("@@brand.identity_block@@")
                         )
 
+                    def _gi_render(ln: str) -> str:
+                        if "@@brand.identity_block@@" not in ln:
+                            return render_fn(ln)
+                        return "@@brand.identity_block@@".join(
+                            render_fn(part)
+                            for part in ln.split("@@brand.identity_block@@")
+                        )
+
                     patched_core_gi = (
                         _patch_core_instruction_preserving_conditionals(
                             raw_core_gi,
@@ -2026,6 +2264,7 @@ def _apply_core_target_backport(
                             disabled_agents=disabled_agents,
                             disabled_tools=disabled_tools,
                             rev_fn=_gi_rev,
+                            render_fn=_gi_render,
                         )
                     )
                 else:
@@ -2057,6 +2296,7 @@ def _apply_core_target_backport(
                             disabled_agents=disabled_agents,
                             disabled_tools=disabled_tools,
                             rev_fn=_rev,
+                            render_fn=render_fn,
                         )
                     )
                 core_gi_path.write_text(patched_core_gi, encoding="utf-8")
@@ -2192,6 +2432,7 @@ def _apply_core_target_backport(
                     disabled_agents=disabled_agents,
                     disabled_tools=disabled_tools,
                     rev_fn=_rev,
+                    render_fn=render_fn,
                 )
                 core_in_path.parent.mkdir(parents=True, exist_ok=True)
                 core_in_path.write_text(patched_in, encoding="utf-8")
