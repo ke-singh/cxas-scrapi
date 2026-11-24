@@ -20,10 +20,13 @@ import contextlib
 import copy
 import difflib
 import json
+import math
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -755,7 +758,7 @@ def _load_normalized_tool(
                         oa_cfg["url"] = (
                             f"{srv_url.rstrip('/')}/{ep_path.lstrip('/')}"
                         )
-                    elif len(paths) == 0:
+                    else:
                         oa_cfg["url"] = srv_url
     return norm_tj, oa_canon, oa_raw
 
@@ -920,6 +923,7 @@ def _build_clean_brand_baselines(
         tmp_man,
         ignore=shutil.ignore_patterns(".git", "__pycache__"),
     )
+    _make_tree_writable(tmp_man)
     ov_path = tmp_man / "brands" / brand_id / "overrides.yaml"
     if clear_all_brand:
         if ov_path.is_file():
@@ -1237,15 +1241,35 @@ def _apply_brand_target_backport(
                 ):
                     summary_parts.append(f"model={live_ms.get('model')}")
 
-                if base_ms.get("temperature") != live_ms.get("temperature"):
-                    target_holder["temperature"] = float(live_ms["temperature"])
-                if ours_ms.get("temperature") != live_ms.get("temperature") or (
-                    scope == "brand"
-                    and base_ms.get("temperature") != live_ms.get("temperature")
+                live_temp = live_ms.get("temperature")
+                base_temp = base_ms.get("temperature")
+                if live_temp is not None and (
+                    isinstance(live_temp, bool)
+                    or not isinstance(live_temp, (int, float))
+                    or not math.isfinite(float(live_temp))
+                    or not (0.0 <= float(live_temp) <= 2.0)
                 ):
-                    summary_parts.append(
-                        f"temperature={live_ms.get('temperature')}"
+                    raise BuildGateError(
+                        f"Invalid modelSettings.temperature {live_temp!r} "
+                        f"on {res_id}: expected a finite number in "
+                        "[0.0, 2.0]."
                     )
+                if base_temp != live_temp or (
+                    isinstance(base_temp, bool) != isinstance(live_temp, bool)
+                ):
+                    if live_temp is None:
+                        raise BuildGateError(
+                            f"Cannot backport null modelSettings.temperature "
+                            f"on {res_id} into {rel_target}: brand overrides "
+                            "can only set numeric values, not clear them; "
+                            f"edit core/agents/{agent_id}/ or envs/*.yaml "
+                            "directly."
+                        )
+                    target_holder["temperature"] = float(live_temp)
+                if ours_ms.get("temperature") != live_temp or (
+                    scope == "brand" and base_temp != live_temp
+                ):
+                    summary_parts.append(f"temperature={live_temp}")
 
             ours_in_path = _resolve_agent_instruction_path(
                 ours_bundle, agent_id, ours_aj_raw
@@ -1459,6 +1483,81 @@ def _apply_brand_target_backport(
     return [ov_path], changes
 
 
+def _make_tree_writable(root: Path) -> None:
+    """Ensure copied temporary directories and files are owner-writable."""
+    for dirpath, _dirnames, filenames in os.walk(root):
+        dp = Path(dirpath)
+        with contextlib.suppress(OSError):
+            os.chmod(
+                dp,
+                dp.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+            )
+        for fname in filenames:
+            fp = dp / fname
+            if not fp.is_symlink():
+                with contextlib.suppress(OSError):
+                    os.chmod(
+                        fp, fp.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR
+                    )
+
+
+def _assert_no_symlink_in_path(raw_path: Path, *, label: str) -> None:
+    """Reject symlinks on ``raw_path`` or any existing ancestor component."""
+    if raw_path.is_symlink():
+        raise BuildGateError(
+            f"Symlinks are not permitted for {label}: {raw_path}"
+        )
+    if raw_path.is_absolute():
+        curr = Path(raw_path.anchor)
+        parts = raw_path.parts[1:]
+    else:
+        cwd = Path.cwd()
+        curr = Path(cwd.anchor)
+        parts = (*cwd.parts[1:], *raw_path.parts)
+    darwin_os_links = (
+        {Path("/tmp"), Path("/var"), Path("/etc")}
+        if sys.platform == "darwin"
+        else set()
+    )
+    for part in parts:
+        curr = curr / part
+        if curr in darwin_os_links:
+            continue
+        if curr.is_symlink():
+            raise BuildGateError(
+                f"Symlinks are not permitted in {label} path {raw_path} "
+                f"(symlink component: {curr})"
+            )
+
+
+def _collect_lock_snapshots(
+    *,
+    lockfile_path: Path | str | None,
+    eff_lock: Path | None,
+    dist_root: Path | None,
+) -> dict[Path, bytes | None]:
+    tracked: list[Path] = []
+    for lp_raw in (lockfile_path, eff_lock):
+        if lp_raw is not None:
+            lp_res = Path(lp_raw).resolve()
+            if lp_res not in tracked:
+                tracked.append(lp_res)
+    if dist_root is not None and _has_app_marker(dist_root):
+        sib_lp = (dist_root.parent / f"{dist_root.name}.lock.json").resolve()
+        if sib_lp not in tracked:
+            tracked.append(sib_lp)
+    return {lp: (lp.read_bytes() if lp.is_file() else None) for lp in tracked}
+
+
+def _restore_lock_snapshots(snapshots: Mapping[Path, bytes | None]) -> None:
+    for lp, data in snapshots.items():
+        if data is None:
+            lp.unlink(missing_ok=True)
+        elif not lp.is_file() or lp.read_bytes() != data:
+            lp.parent.mkdir(parents=True, exist_ok=True)
+            lp.write_bytes(data)
+
+
 def _snapshot_directory_bytes(
     root: Path,
 ) -> tuple[dict[Path, bytes], set[Path]]:
@@ -1503,7 +1602,8 @@ def _restore_directory_bytes(
             extra_dir.rmdir()
     for path, data in sorted(snap_files.items()):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        if not path.is_file() or path.read_bytes() != data:
+            path.write_bytes(data)
 
 
 def _validate_git_branch_precheck(
@@ -1741,7 +1841,7 @@ def _read_deployment_triplet(
             continue
         try:
             data = yaml.safe_load(dep.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
             continue
         if isinstance(data, dict) and data.get("brandId"):
             return (
@@ -2044,15 +2144,6 @@ def backport_live_to_source(
     _validate_dir_no_symlinks_gate(c_dir, label="core directory")
     _validate_dir_no_symlinks_gate(m_dir, label="manifests directory")
 
-    if lockfile_path is not None and Path(lockfile_path).is_symlink():
-        raise BuildGateError(
-            f"Symlinks are not permitted for --lockfile: {lockfile_path}"
-        )
-    if pr_body_out is not None and Path(pr_body_out).is_symlink():
-        raise BuildGateError(
-            f"Symlinks are not permitted for --pr-body-out: {pr_body_out}"
-        )
-
     repo_root = (
         c_dir.parent
         if c_dir.parent == m_dir.parent
@@ -2079,22 +2170,30 @@ def backport_live_to_source(
         raise BuildGateError(f"Live directory does not exist: {live_root}")
     _validate_dir_no_symlinks_gate(live_root, label="live directory")
 
-    dist_root = Path(dist_dir).resolve() if dist_dir is not None else None
-    if dist_dir is not None and Path(dist_dir).is_symlink():
-        raise BuildGateError(
-            f"Symlinks are not permitted for --dist: {dist_dir}"
-        )
-    if dist_root is not None:
-        for protected, p_label in (
-            (c_dir, "core"),
-            (m_dir, "manifests"),
-            (live_root, "live"),
-        ):
-            if _paths_overlap(dist_root, protected):
+    protected_dirs = (
+        (c_dir, "core"),
+        (m_dir, "manifests"),
+        (live_root, "live"),
+    )
+    for out_raw, out_label in (
+        (dist_dir, "--dist"),
+        (conflicts_dir, "--conflicts-dir"),
+        (lockfile_path, "--lockfile"),
+        (pr_body_out, "--pr-body-out"),
+    ):
+        if out_raw is None:
+            continue
+        raw_out_p = Path(out_raw)
+        _assert_no_symlink_in_path(raw_out_p, label=out_label)
+        res_out_p = raw_out_p.resolve()
+        for protected, p_label in protected_dirs:
+            if _paths_overlap(res_out_p, protected):
                 raise BuildGateError(
-                    f"dist directory '{dist_root}' must not overlap with "
+                    f"{out_label} path '{res_out_p}' must not overlap with "
                     f"{p_label} directory '{protected}'."
                 )
+
+    dist_root = Path(dist_dir).resolve() if dist_dir is not None else None
 
     prelim_live = live_root if _has_app_marker(live_root) else None
     prelim_dist = (
@@ -2373,32 +2472,53 @@ def backport_live_to_source(
         checked_out_branch: str | None = None
 
         if not changed_res_ids:
-            if not dry_run and git_precheck is not None:
-                checked_out_branch = _checkout_git_branch(
-                    repo_root, git_precheck[0], git_precheck[1]
-                )
             unchanged_siblings = sorted(
                 b_id for b_id in pre_hashes if b_id != canonical_app_id
             )
             out_lock_path: Path | None = eff_lock
             if not dry_run:
-                if dist_root is not None:
-                    out_lock_path = _refresh_dist_and_lock(
-                        core_dir=c_dir,
-                        manifests_dir=m_dir,
-                        manifests=manifests,
-                        dist_root=dist_root,
-                        brand_id=eff_brand,
-                        channel=eff_channel,
-                        environment=eff_env,
-                        lockfile_path=lockfile_path,
-                        eff_lock=eff_lock,
-                        lock_source=live_bundle,
-                    )
-                elif lockfile_path is not None:
-                    out_lock_path = write_lockfile(
-                        live_bundle, lockfile_path, app_id=ours_bundle.name
-                    )
+                noop_dist_snap = (
+                    _snapshot_directory_bytes(dist_root)
+                    if dist_root is not None and dist_root.is_dir()
+                    else None
+                )
+                noop_lock_snaps = _collect_lock_snapshots(
+                    lockfile_path=lockfile_path,
+                    eff_lock=eff_lock,
+                    dist_root=dist_root,
+                )
+                try:
+                    if dist_root is not None:
+                        out_lock_path = _refresh_dist_and_lock(
+                            core_dir=c_dir,
+                            manifests_dir=m_dir,
+                            manifests=manifests,
+                            dist_root=dist_root,
+                            brand_id=eff_brand,
+                            channel=eff_channel,
+                            environment=eff_env,
+                            lockfile_path=lockfile_path,
+                            eff_lock=eff_lock,
+                            lock_source=live_bundle,
+                        )
+                    elif lockfile_path is not None:
+                        out_lock_path = write_lockfile(
+                            live_bundle,
+                            lockfile_path,
+                            app_id=ours_bundle.name,
+                        )
+                    if git_precheck is not None:
+                        checked_out_branch = _checkout_git_branch(
+                            repo_root, git_precheck[0], git_precheck[1]
+                        )
+                except Exception:
+                    if dist_root is not None:
+                        if noop_dist_snap is not None:
+                            _restore_directory_bytes(dist_root, noop_dist_snap)
+                        elif dist_root.exists():
+                            shutil.rmtree(dist_root)
+                    _restore_lock_snapshots(noop_lock_snaps)
+                    raise
 
             noop_res = BackportResult(
                 app_id=canonical_app_id,
@@ -2434,18 +2554,43 @@ def backport_live_to_source(
             brand_id=eff_brand,
         )
 
-        core_snapshot = _snapshot_directory_bytes(c_dir)
-        man_snapshot = _snapshot_directory_bytes(m_dir)
-        should_restore = dry_run
+        if dry_run:
+            work_m_dir = work_root / "dry_run_manifests"
+            shutil.copytree(
+                m_dir,
+                work_m_dir,
+                ignore=shutil.ignore_patterns(".git", "__pycache__"),
+            )
+            _make_tree_writable(work_m_dir)
+            core_snapshot: tuple[dict[Path, bytes], set[Path]] | None = None
+            man_snapshot: tuple[dict[Path, bytes], set[Path]] | None = None
+            dist_snapshot: tuple[dict[Path, bytes], set[Path]] | None = None
+            lock_snapshots: dict[Path, bytes | None] = {}
+        else:
+            work_m_dir = m_dir
+            core_snapshot = _snapshot_directory_bytes(c_dir)
+            man_snapshot = _snapshot_directory_bytes(m_dir)
+            dist_snapshot = (
+                _snapshot_directory_bytes(dist_root)
+                if dist_root is not None and dist_root.is_dir()
+                else None
+            )
+            lock_snapshots = _collect_lock_snapshots(
+                lockfile_path=lockfile_path,
+                eff_lock=eff_lock,
+                dist_root=dist_root,
+            )
+
+        final_lock_path: Path | None = eff_lock
         try:
             base_map = (
                 brand_only_bundles
                 if scope == "channel" and brand_only_bundles is not None
                 else (unoverridden_bundles or {})
             )
-            modified_files, changes = _apply_brand_target_backport(
+            raw_modified_files, changes = _apply_brand_target_backport(
                 core_dir=c_dir,
-                manifests_dir=m_dir,
+                manifests_dir=work_m_dir,
                 manifests=manifests,
                 brand_id=eff_brand,
                 channel=eff_channel,
@@ -2456,10 +2601,22 @@ def backport_live_to_source(
                 base_bundles_by_channel=base_map,
                 changed_res_ids=changed_res_ids,
             )
+            modified_files = (
+                [
+                    m_dir / mf.relative_to(work_m_dir)
+                    if mf.is_relative_to(work_m_dir)
+                    else mf
+                    for mf in raw_modified_files
+                ]
+                if dry_run
+                else raw_modified_files
+            )
 
             post_dist_root = work_root / "post_dist"
             try:
-                post_reports = build_all(c_dir, m_dir, post_dist_root, eff_env)
+                post_reports = build_all(
+                    c_dir, work_m_dir, post_dist_root, eff_env
+                )
             except (BuildError, ManifestError) as exc:
                 raise BuildGateError(str(exc)) from exc
 
@@ -2487,7 +2644,7 @@ def backport_live_to_source(
                     ] != pre_hashes.get(app_key):
                         e_cnt, w_cnt = _enforce_lint_clean(
                             rep.out_dir,
-                            manifests_dir=m_dir,
+                            manifests_dir=work_m_dir,
                             brand_id=rep.brand_id,
                             channel=rep.channel,
                             stage_label="rebuilt bundle",
@@ -2549,42 +2706,45 @@ def backport_live_to_source(
                             f"sister-brand bundle {b_id!r}."
                         )
 
-            if not dry_run and dist_root is None and lockfile_path is not None:
-                final_lock_from_post: Path | None = write_lockfile(
-                    live_bundle,
-                    lockfile_path,
-                    app_id=post_target_bundle.name,
-                )
-            else:
-                final_lock_from_post = eff_lock
+            if not dry_run:
+                if dist_root is not None:
+                    refreshed_manifests = load_manifests(m_dir)
+                    final_lock_path = _refresh_dist_and_lock(
+                        core_dir=c_dir,
+                        manifests_dir=m_dir,
+                        manifests=refreshed_manifests,
+                        dist_root=dist_root,
+                        brand_id=eff_brand,
+                        channel=eff_channel,
+                        environment=eff_env,
+                        lockfile_path=lockfile_path,
+                        eff_lock=eff_lock,
+                        lock_source=live_bundle,
+                    )
+                elif lockfile_path is not None:
+                    final_lock_path = write_lockfile(
+                        live_bundle,
+                        lockfile_path,
+                        app_id=post_target_bundle.name,
+                    )
 
-            if not dry_run and git_precheck is not None:
-                checked_out_branch = _checkout_git_branch(
-                    repo_root, git_precheck[0], git_precheck[1]
-                )
+                if git_precheck is not None:
+                    checked_out_branch = _checkout_git_branch(
+                        repo_root, git_precheck[0], git_precheck[1]
+                    )
         except Exception:
-            should_restore = True
+            if not dry_run:
+                if core_snapshot is not None:
+                    _restore_directory_bytes(c_dir, core_snapshot)
+                if man_snapshot is not None:
+                    _restore_directory_bytes(m_dir, man_snapshot)
+                if dist_root is not None:
+                    if dist_snapshot is not None:
+                        _restore_directory_bytes(dist_root, dist_snapshot)
+                    elif dist_root.exists():
+                        shutil.rmtree(dist_root)
+                _restore_lock_snapshots(lock_snapshots)
             raise
-        finally:
-            if should_restore:
-                _restore_directory_bytes(c_dir, core_snapshot)
-                _restore_directory_bytes(m_dir, man_snapshot)
-
-    final_lock_path: Path | None = final_lock_from_post
-    if not dry_run and dist_root is not None:
-        refreshed_manifests = load_manifests(m_dir)
-        final_lock_path = _refresh_dist_and_lock(
-            core_dir=c_dir,
-            manifests_dir=m_dir,
-            manifests=refreshed_manifests,
-            dist_root=dist_root,
-            brand_id=eff_brand,
-            channel=eff_channel,
-            environment=eff_env,
-            lockfile_path=lockfile_path,
-            eff_lock=eff_lock,
-            lock_source=live_bundle,
-        )
 
     result = BackportResult(
         app_id=canonical_app_id,
