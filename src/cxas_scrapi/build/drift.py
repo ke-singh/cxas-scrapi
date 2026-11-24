@@ -38,6 +38,7 @@ from cxas_scrapi.build.bundle_io import (
     load_mapping_strict,
     read_utf8_strict,
     write_canonical_json,
+    write_canonical_mapping,
 )
 from cxas_scrapi.core.python_bundler import (
     PythonBundlerError,
@@ -812,19 +813,53 @@ def _adopt_live_resource_into_ours(
     _validate_safe_identifier(res_id, label="resource_id")
     ours_bundle.mkdir(parents=True, exist_ok=True)
     if res_id == "app":
-        live_app_json = live_bundle / "app.json"
-        ours_app_json = ours_bundle / "app.json"
-        if live_app_json.is_file():
-            raw_app = load_json_dict_strict(
-                live_app_json, context="live app.json"
+        live_app_cfg = _find_config_file(
+            live_bundle, "app", live_bundle, label="live bundle"
+        )
+        ours_existing_ext: str | None = None
+        ours_preserved_cp: dict[str, Any] = {}
+        for ext in _CONFIG_EXTS:
+            cand = ours_bundle / f"app{ext}"
+            if cand.is_symlink():
+                raise BuildGateError(
+                    f"Symlinks are not permitted in ours bundle: {cand}"
+                )
+            if cand.is_file():
+                assert_safe_subpath(cand, ours_bundle, label="ours bundle")
+                if ours_existing_ext is None:
+                    ours_existing_ext = ext
+                    ours_raw_app = load_mapping_strict(
+                        cand, context=f"ours {cand.name}"
+                    )
+                    for cp_key in APP_CONTROL_PLANE_KEYS:
+                        if cp_key in ours_raw_app:
+                            ours_preserved_cp[cp_key] = ours_raw_app[cp_key]
+                cand.unlink()
+
+        if live_app_cfg is not None:
+            raw_app = load_mapping_strict(
+                live_app_cfg, context=f"live {live_app_cfg.name}"
             )
             norm_app = normalize_json_obj(raw_app, is_root=True)
-            write_canonical_json(ours_app_json, norm_app)
-        elif ours_app_json.exists():
-            ours_app_json.unlink()
+            for cp_key, cp_val in ours_preserved_cp.items():
+                norm_app[cp_key] = cp_val
+            target_ext = (
+                ours_existing_ext
+                if ours_existing_ext is not None
+                else live_app_cfg.suffix.lower()
+            )
+            write_canonical_mapping(ours_bundle / f"app{target_ext}", norm_app)
 
         live_global = live_bundle / "global_instruction.txt"
         ours_global = ours_bundle / "global_instruction.txt"
+        if live_global.is_symlink():
+            raise BuildGateError(
+                f"Symlinks are not permitted in live bundle: {live_global}"
+            )
+        if ours_global.is_symlink():
+            raise BuildGateError(
+                f"Symlinks are not permitted in ours bundle: {ours_global}"
+            )
         if live_global.is_file():
             ours_global.parent.mkdir(parents=True, exist_ok=True)
             ours_global.write_text(
@@ -841,18 +876,28 @@ def _adopt_live_resource_into_ours(
         return
 
     category, item_name = res_id.split("/", 1)
-    ours_item_dir = ours_bundle / category / item_name
-    ours_flat_json = ours_bundle / category / f"{item_name}.json"
-    live_item_dir = live_bundle / category / item_name
-    live_flat_json = live_bundle / category / f"{item_name}.json"
+    ours_cat_dir = ours_bundle / category
+    live_cat_dir = live_bundle / category
+    ours_item_dir = ours_cat_dir / item_name
+    live_item_dir = live_cat_dir / item_name
     assert_safe_subpath(ours_item_dir, ours_bundle, label="ours bundle")
-    assert_safe_subpath(ours_flat_json, ours_bundle, label="ours bundle")
 
     if ours_item_dir.exists():
         shutil.rmtree(ours_item_dir)
-    if ours_flat_json.exists():
-        ours_flat_json.unlink()
 
+    ours_flat_ext: str | None = None
+    for ext in _CONFIG_EXTS:
+        ours_flat = ours_cat_dir / f"{item_name}{ext}"
+        assert_safe_subpath(ours_flat, ours_bundle, label="ours bundle")
+        if ours_flat.is_file():
+            if ours_flat_ext is None:
+                ours_flat_ext = ext
+            ours_flat.unlink()
+
+    if live_item_dir.is_symlink():
+        raise BuildGateError(
+            f"Symlinks are not permitted in live bundle: {live_item_dir}"
+        )
     if live_item_dir.is_dir():
         assert_safe_subpath(live_item_dir, live_bundle, label="live bundle")
         ours_item_dir.mkdir(parents=True, exist_ok=True)
@@ -873,7 +918,8 @@ def _adopt_live_resource_into_ours(
                 dst_file = ours_item_dir / rel
                 assert_safe_subpath(dst_file, ours_bundle, label="ours bundle")
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
-                if src_file.suffix == ".json":
+                suffix = src_file.suffix.lower()
+                if suffix == ".json":
                     is_root_json = len(rel.parts) == 1
                     if is_root_json:
                         raw_obj: Any = load_json_dict_strict(
@@ -902,7 +948,17 @@ def _adopt_live_resource_into_ours(
                             + "\n",
                             encoding="utf-8",
                         )
-                elif src_file.suffix == ".py":
+                elif (
+                    len(rel.parts) == 1
+                    and suffix in {".yaml", ".yml"}
+                    and src_file.name not in _OPENAPI_SCHEMA_FILENAMES
+                ):
+                    raw_yaml = load_mapping_strict(
+                        src_file, context=f"live {res_id} YAML"
+                    )
+                    norm_yaml = normalize_json_obj(raw_yaml, is_root=True)
+                    write_canonical_mapping(dst_file, norm_yaml)
+                elif suffix == ".py":
                     raw_py = read_utf8_strict(
                         src_file, context=f"live {res_id} Python file"
                     )
@@ -939,14 +995,27 @@ def _adopt_live_resource_into_ours(
                             text.replace("\r\n", "\n"),
                             encoding="utf-8",
                         )
-    elif live_flat_json.is_file():
-        assert_safe_subpath(live_flat_json, live_bundle, label="live bundle")
-        ours_item_dir.mkdir(parents=True, exist_ok=True)
-        raw_obj = load_json_dict_strict(
-            live_flat_json, context=f"live {res_id} JSON"
+    elif live_cat_dir.is_symlink():
+        raise BuildGateError(
+            f"Symlinks are not permitted in live bundle: {live_cat_dir}"
         )
-        norm_obj = normalize_json_obj(raw_obj, is_root=True)
-        write_canonical_json(ours_item_dir / f"{item_name}.json", norm_obj)
+    elif live_cat_dir.is_dir():
+        live_flat_cfg = _find_config_file(
+            live_cat_dir, item_name, live_bundle, label="live bundle"
+        )
+        if live_flat_cfg is not None:
+            raw_obj = load_mapping_strict(
+                live_flat_cfg, context=f"live {res_id} config"
+            )
+            norm_obj = normalize_json_obj(raw_obj, is_root=True)
+            target_ext = (
+                ours_flat_ext
+                if ours_flat_ext is not None
+                else live_flat_cfg.suffix.lower()
+            )
+            dst_flat = ours_cat_dir / f"{item_name}{target_ext}"
+            assert_safe_subpath(dst_flat, ours_bundle, label="ours bundle")
+            write_canonical_mapping(dst_flat, norm_obj)
 
 
 def _validate_git_mirror_dir(mirror_dir: Path) -> None:

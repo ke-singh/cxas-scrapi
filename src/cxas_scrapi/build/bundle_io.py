@@ -198,6 +198,20 @@ def write_canonical_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def write_canonical_mapping(path: Path, payload: dict[str, Any]) -> None:
+    """Writes canonical JSON or YAML depending on ``path.suffix``."""
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        if path.is_symlink():
+            raise BuildGateError(f"Refusing to write through symlink: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            yaml.safe_dump(payload, sort_keys=True, allow_unicode=True),
+            encoding="utf-8",
+        )
+        return
+    write_canonical_json(path, payload)
+
+
 __all__ = [
     "BuildGateError",
     "DriftGateError",
@@ -209,4 +223,5 @@ __all__ = [
     "load_mapping_strict",
     "read_utf8_strict",
     "write_canonical_json",
+    "write_canonical_mapping",
 ]
