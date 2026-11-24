@@ -386,6 +386,25 @@ def _read_json_strict(path: Path) -> Any:
         raise BuildError(f"{path}: invalid JSON: {exc}") from exc
 
 
+def _read_resource_display_name(resource_dir: Path) -> str:
+    """Read ``displayName`` from ``<id>.{json,yaml,yml}`` if present."""
+    for suffix in (".json", ".yaml", ".yml"):
+        cfg_path = resource_dir / f"{resource_dir.name}{suffix}"
+        if not cfg_path.is_file():
+            continue
+        if suffix == ".json":
+            data = _read_json_strict(cfg_path)
+        else:
+            try:
+                data = yaml.safe_load(cfg_path.read_text("utf-8"))
+            except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+                raise BuildError(f"{cfg_path}: invalid YAML: {exc}") from exc
+        if isinstance(data, dict) and isinstance(data.get("displayName"), str):
+            return data["displayName"]
+        return ""
+    return ""
+
+
 def _validate_tree_no_symlinks(root_dir: Path, *, label: str) -> None:
     """Reject symlinks and paths resolving outside ``root_dir``."""
     resolved_root = root_dir.resolve()
@@ -599,6 +618,7 @@ def build_app(
             out_dir=out_dir,
         )
     else:
+        _validate_tree_no_symlinks(core_dir, label="core")
         if out_dir.exists():
             shutil.rmtree(out_dir)
         shutil.copytree(
@@ -617,7 +637,6 @@ def build_app(
         if (out_dir / "tools").is_dir()
         else set()
     )
-    had_global_instruction = (out_dir / "global_instruction.txt").is_file()
 
     # Ensure environment.json exists when env_manifest defines overrides so it
     # flows through the merge, pruning, and token-substitution pipeline.
@@ -639,12 +658,7 @@ def build_app(
     if agents_dir.exists():
         for agent_path in sorted(agents_dir.iterdir()):
             if agent_path.is_dir():
-                a_json = agent_path / f"{agent_path.name}.json"
-                display_name = ""
-                if a_json.exists():
-                    d = _read_json_strict(a_json)
-                    if isinstance(d, dict):
-                        display_name = d.get("displayName", "")
+                display_name = _read_resource_display_name(agent_path)
                 if (
                     agent_path.name in disabled_agents
                     or display_name in disabled_agents
@@ -657,12 +671,7 @@ def build_app(
     if tools_dir.exists():
         for tool_path in sorted(tools_dir.iterdir()):
             if tool_path.is_dir():
-                t_json = tool_path / f"{tool_path.name}.json"
-                display_name = ""
-                if t_json.exists():
-                    d = _read_json_strict(t_json)
-                    if isinstance(d, dict):
-                        display_name = d.get("displayName", "")
+                display_name = _read_resource_display_name(tool_path)
                 if (
                     tool_path.name in disabled_tools
                     or display_name in disabled_tools
@@ -852,7 +861,6 @@ def build_app(
         return val
 
     # 4. Prune references & render tokens across surviving files
-    global_identity_prefix: str | None = None
     rendered_identity_block: str | None = None
     for root, dirs, files in os.walk(out_dir):
         dirs.sort()
@@ -963,7 +971,6 @@ def build_app(
                             "@@brand.identity_block@@", identity_block
                         )
                     else:
-                        global_identity_prefix = rendered_identity_block
                         text = identity_block + "\n\n" + text
 
                 try:
@@ -980,14 +987,55 @@ def build_app(
                 validate_modalities(text, path.relative_to(out_dir))
 
             elif file.endswith((".yaml", ".yml")):
-                text = path.read_text("utf-8")
-                if "@@" in text or "{@start" in text or "{@end" in text:
+                try:
+                    text = path.read_text("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise BuildError(
+                        f"{path}: file is not valid UTF-8: {exc}"
+                    ) from exc
+                has_tokens = (
+                    "@@" in text or "{@start" in text or "{@end" in text
+                )
+                if has_tokens:
                     try:
-                        text = process_conditional_blocks(text)
-                        text = process_string(text)
+                        if "{@start" in text or "{@end" in text:
+                            text = process_conditional_blocks(text)
+                        data = yaml.safe_load(text)
+                    except (yaml.YAMLError, BuildError) as exc:
+                        raise BuildError(f"{path}: {exc}") from exc
+                    if isinstance(data, dict):
+                        if isinstance(data.get("childAgents"), list):
+                            data["childAgents"] = [
+                                c
+                                for c in data["childAgents"]
+                                if (
+                                    c.get("displayName")
+                                    if isinstance(c, dict)
+                                    else c
+                                )
+                                not in all_disabled_agents
+                            ]
+                        if isinstance(data.get("tools"), list):
+                            data["tools"] = [
+                                t
+                                for t in data["tools"]
+                                if (
+                                    t.get("displayName")
+                                    if isinstance(t, dict)
+                                    else t
+                                )
+                                not in all_disabled_tools
+                            ]
+                    try:
+                        data = process_json(data)
                     except BuildError as e:
                         raise BuildError(f"{path}: {e}") from e
-                    path.write_text(text, "utf-8")
+                    path.write_text(
+                        yaml.safe_dump(
+                            data, sort_keys=False, allow_unicode=True
+                        ),
+                        "utf-8",
+                    )
 
             elif file.endswith(".py"):
                 text = path.read_text("utf-8")
@@ -1010,8 +1058,6 @@ def build_app(
             rendered_identity_block = process_string(
                 _build_identity_block(manifests, brand_id)
             )
-        if global_identity_prefix is None and not had_global_instruction:
-            global_identity_prefix = rendered_identity_block
         apply_brand_overrides(
             out_dir=out_dir,
             brand_id=brand_id,
@@ -1019,7 +1065,7 @@ def build_app(
             permitted_channels=set(policy.channels.keys()),
             ov=brand_ov,
             render_fn=process_string,
-            global_identity_prefix=global_identity_prefix,
+            global_identity_prefix=rendered_identity_block,
             global_identity_block=rendered_identity_block,
             known_agents=known_agents,
             known_tools=known_tools,

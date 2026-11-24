@@ -262,6 +262,13 @@ class LineReplacement(_StrictModel):
     match: str = Field(min_length=1)
     replace_with: str = Field(alias="with")
 
+    @field_validator("match")
+    @classmethod
+    def _non_whitespace_match(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("match must not be empty or whitespace")
+        return value
+
 
 class InstructionOverride(_StrictModel):
     """Structured prompt override (`instruction`, `replace_lines`, rules)."""

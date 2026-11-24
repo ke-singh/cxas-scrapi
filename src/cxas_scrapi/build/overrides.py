@@ -38,7 +38,10 @@ if TYPE_CHECKING:
 # CES replaces OpenAPI `servers[].url` with this placeholder on export and
 # moves the concrete URL into environment.json (`tools.<name>.openApiTool.url`).
 CES_ENV_VAR_PLACEHOLDER = "$env_var"
-_OPENAPI_SERVER_URL_RE = re.compile(r"^(\s*-\s*url:\s*)\S.*$")
+_OPENAPI_SERVERS_HEADER_RE = re.compile(r"^servers:\s*(?:#.*)?$")
+_OPENAPI_SERVER_URL_RE = re.compile(r"^(\s*(?:-\s+)?url:\s*)(.+?)\s*$")
+_OPENAPI_LIST_ITEM_RE = re.compile(r"^(\s*)-\s+(.*)$")
+_OPENAPI_KEY_RE = re.compile(r"^(\s*)([A-Za-z0-9_.-]+):")
 _CONFIG_SUFFIXES = (".json", ".yaml", ".yml")
 
 
@@ -149,9 +152,10 @@ def apply_line_replacements_strict(
     for rep in replacements:
         m_rendered = render_fn(rep.match.replace("\r\n", "\n")).rstrip("\n")
         w_rendered = render_fn(rep.replace_with.replace("\r\n", "\n"))
-        if not m_rendered:
+        if not m_rendered.strip():
             raise BuildError(
-                f"{context_label}: empty replace_lines match pattern."
+                f"{context_label}: empty or whitespace-only replace_lines "
+                "match pattern."
             )
         m_lines = m_rendered.split("\n")
         w_lines = (
@@ -237,7 +241,7 @@ def apply_instruction_override(
     """Layer brand-wide and channel-scoped instruction overrides."""
     if ch_ov is not None and ch_ov.instruction is not None:
         rendered_ch = render_fn(ch_ov.instruction.replace("\r\n", "\n"))
-        if identity_prefix and not rendered_ch.startswith(identity_prefix):
+        if identity_prefix and identity_prefix not in rendered_ch:
             text = identity_prefix + "\n\n" + rendered_ch.lstrip("\n")
         else:
             text = rendered_ch
@@ -255,7 +259,7 @@ def apply_instruction_override(
 
     if brand_ov is not None and brand_ov.instruction is not None:
         rendered_br = render_fn(brand_ov.instruction.replace("\r\n", "\n"))
-        if identity_prefix and not rendered_br.startswith(identity_prefix):
+        if identity_prefix and identity_prefix not in rendered_br:
             text = identity_prefix + "\n\n" + rendered_br.lstrip("\n")
         else:
             text = rendered_br
@@ -287,6 +291,78 @@ def apply_instruction_override(
         )
 
     return text
+
+
+def _is_env_var_yaml_scalar(raw_value: str) -> bool:
+    """Return True if a YAML scalar represents ``$env_var`` (quoted or not)."""
+    try:
+        parsed = yaml.safe_load(raw_value)
+    except yaml.YAMLError:
+        return raw_value.strip() == CES_ENV_VAR_PLACEHOLDER
+    return parsed == CES_ENV_VAR_PLACEHOLDER
+
+
+def _rewrite_openapi_servers_urls(
+    oa_raw: str, srv_val: str
+) -> tuple[str, bool]:
+    """Update ``url:`` entries strictly inside the top-level ``servers:`` block.
+
+    Supports both single-line (``- url: ...``) and multi-line server items
+    (e.g. ``- description: ...`` followed by ``  url: ...``), preserves quoted
+    or unquoted ``$env_var`` placeholders, skips nested ``variables:`` blocks,
+    and never modifies ``url:`` lines outside top-level ``servers:``.
+    """
+    in_servers = False
+    in_variables = False
+    vars_indent = 0
+    new_lines: list[str] = []
+    changed = False
+
+    for line in oa_raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            new_lines.append(line)
+            continue
+
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_servers = bool(_OPENAPI_SERVERS_HEADER_RE.match(line))
+            in_variables = False
+            new_lines.append(line)
+            continue
+
+        if not in_servers:
+            new_lines.append(line)
+            continue
+
+        if _OPENAPI_LIST_ITEM_RE.match(line):
+            in_variables = False
+
+        if in_variables and indent <= vars_indent:
+            in_variables = False
+
+        m_key = _OPENAPI_KEY_RE.match(line)
+        if m_key and m_key.group(2) == "variables" and not in_variables:
+            in_variables = True
+            vars_indent = indent
+            new_lines.append(line)
+            continue
+
+        if not in_variables:
+            m_srv = _OPENAPI_SERVER_URL_RE.match(line)
+            if m_srv:
+                prefix, raw_val = m_srv.group(1), m_srv.group(2)
+                if not _is_env_var_yaml_scalar(raw_val):
+                    new_line = f"{prefix}{srv_val}"
+                    if new_line != line:
+                        changed = True
+                    new_lines.append(new_line)
+                    continue
+
+        new_lines.append(line)
+
+    rebuilt = "\n".join(new_lines) + ("\n" if oa_raw.endswith("\n") else "")
+    return rebuilt, changed
 
 
 def _resolve_openapi_schema_path(
@@ -446,7 +522,7 @@ def apply_brand_overrides(
             new_gi
             and not cur_gi
             and global_identity_prefix
-            and not new_gi.startswith(global_identity_prefix)
+            and global_identity_prefix not in new_gi
         ):
             new_gi = global_identity_prefix + "\n\n" + new_gi.lstrip("\n")
         if new_gi != cur_gi:
@@ -463,6 +539,7 @@ def apply_brand_overrides(
         _assert_within_dir(ag_dir, out_dir, label=ag_label)
         a_ch_ov = ag_ov.channels.get(channel)
 
+        ag_data: dict[str, Any] | None = None
         ag_cfg_path = _find_resource_config(ag_dir, agent_id)
         if ag_cfg_path is not None:
             ag_data = _read_config_dict(ag_cfg_path, out_dir, label=ag_label)
@@ -501,6 +578,18 @@ def apply_brand_overrides(
                 )
 
         instr_path = ag_dir / "instruction.txt"
+        raw_instr = (
+            ag_data.get("instruction") if isinstance(ag_data, dict) else None
+        )
+        if isinstance(raw_instr, str) and raw_instr.strip():
+            rel_instr = raw_instr.strip()
+            candidate = out_dir / rel_instr
+            if not candidate.is_file() and (
+                ("/" not in rel_instr and "\\" not in rel_instr)
+                or (ag_dir / rel_instr).is_file()
+            ):
+                candidate = ag_dir / rel_instr
+            instr_path = candidate
         has_instr_ov = (
             ag_ov.instruction is not None
             or bool(ag_ov.replace_lines)
@@ -515,7 +604,7 @@ def apply_brand_overrides(
             )
         )
         if has_instr_ov:
-            instr_label = f"{ag_label}/instruction.txt"
+            instr_label = f"{ag_label}/{instr_path.name}"
             _assert_within_dir(instr_path, out_dir, label=instr_label)
             cur_in = (
                 instr_path.read_text("utf-8") if instr_path.is_file() else ""
@@ -527,6 +616,7 @@ def apply_brand_overrides(
                 render_fn=render_fn,
                 context_label=instr_label,
             )
+            instr_path.parent.mkdir(parents=True, exist_ok=True)
             instr_path.write_text(new_in, "utf-8")
             if validate_modalities_fn is not None:
                 validate_modalities_fn(new_in, instr_path.relative_to(out_dir))
@@ -602,7 +692,9 @@ def apply_brand_overrides(
                             label=f"{t_label} environment.json",
                         )
 
-            if "url" in oa_cfg or not env_updated:
+            if (not env_updated) or (
+                "url" in oa_cfg and oa_cfg.get("url") != CES_ENV_VAR_PLACEHOLDER
+            ):
                 oa_cfg["url"] = r_url
                 t_mod = True
 
@@ -633,25 +725,11 @@ def apply_brand_overrides(
                     )
                     else r_url
                 )
-                new_oa_lines: list[str] = []
-                oa_changed = False
-                for line in oa_raw.splitlines():
-                    m_srv = _OPENAPI_SERVER_URL_RE.match(line)
-                    if m_srv:
-                        cur_srv = line[len(m_srv.group(1)) :].strip()
-                        if cur_srv != CES_ENV_VAR_PLACEHOLDER:
-                            new_line = f"{m_srv.group(1)}{srv_val}"
-                            if new_line != line:
-                                oa_changed = True
-                            new_oa_lines.append(new_line)
-                            continue
-                    new_oa_lines.append(line)
+                rebuilt_oa, oa_changed = _rewrite_openapi_servers_urls(
+                    oa_raw, srv_val
+                )
                 if oa_changed:
-                    oa_yaml_path.write_text(
-                        "\n".join(new_oa_lines)
-                        + ("\n" if oa_raw.endswith("\n") else ""),
-                        "utf-8",
-                    )
+                    oa_yaml_path.write_text(rebuilt_oa, "utf-8")
 
         if t_mod:
             _write_config_dict(t_cfg_path, out_dir, t_data, label=t_label)
