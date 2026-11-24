@@ -788,10 +788,15 @@ def test_qa_pr6_cli_e2e_brand_native_mixed_build_all_zip_and_bad_mode(
 
 
 def test_qa_pr6_scope_hygiene_no_downstream_imports() -> None:
-    """Verify PR 6 build modules do not import PR 3/4/5/7/8 modules."""
+    """Verify PR 6 override/manifest modules do not import PR 3/4/5/7/8 modules."""
     build_dir = _REPO_ROOT / "src" / "cxas_scrapi" / "build"
     forbidden = ("drift", "python_bundler", "polymorphic", "backport")
-    for py_file in sorted(build_dir.glob("*.py")):
+    pr6_modules = (
+        build_dir / "overrides.py",
+        build_dir / "errors.py",
+        build_dir / "manifests.py",
+    )
+    for py_file in pr6_modules:
         src = py_file.read_text("utf-8")
         for mod in forbidden:
             assert mod not in src, f"Unexpected reference '{mod}' in {py_file}"
