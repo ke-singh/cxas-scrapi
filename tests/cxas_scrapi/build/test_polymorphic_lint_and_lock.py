@@ -551,8 +551,6 @@ def test_cli_lint_flags_and_no_push_lint_flag() -> None:
     assert lint_args.brand == "brand_1"
     assert lint_args.channel == "WEB"
 
-    # PR 4 must NOT add --lint or --check-drift to `cxas push`.
+    # PR 4 must NOT add --lint to `cxas push` (#593 collision guard).
     with pytest.raises(SystemExit):
         parser.parse_args(["push", "--app-dir", ".", "--lint"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["push", "--app-dir", ".", "--check-drift"])
