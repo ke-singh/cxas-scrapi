@@ -27,6 +27,20 @@ from cxas_scrapi.build.builder import (
     build_all,
     build_app,
 )
+from cxas_scrapi.build.bundle_io import (
+    BuildGateError,
+    DriftGateError,
+    DriftReport,
+    NormalizedResource,
+    ResourceDrift,
+)
+from cxas_scrapi.build.drift import (
+    check_drift,
+    enforce_pre_push_gate,
+    extract_normalized_resources,
+    normalize_json_obj,
+    write_lockfile,
+)
 from cxas_scrapi.build.manifests import (
     BrandIdentity,
     ChannelCapabilities,
@@ -42,15 +56,25 @@ from cxas_scrapi.build.manifests import (
 __all__ = [
     "BrandIdentity",
     "BuildError",
+    "BuildGateError",
     "BuildReport",
     "ChannelCapabilities",
     "ChannelPolicy",
     "ContentBlockCatalog",
+    "DriftGateError",
+    "DriftReport",
     "EnvManifest",
     "ManifestError",
     "Manifests",
+    "NormalizedResource",
+    "ResourceDrift",
     "TtsVoice",
     "build_all",
     "build_app",
+    "check_drift",
+    "enforce_pre_push_gate",
+    "extract_normalized_resources",
     "load_manifests",
+    "normalize_json_obj",
+    "write_lockfile",
 ]

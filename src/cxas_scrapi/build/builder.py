@@ -29,6 +29,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, Field
 
+from cxas_scrapi.build.drift import write_lockfile
 from cxas_scrapi.build.manifests import (
     CHANNEL_PROFILE_TYPES,
     Manifests,
@@ -67,6 +68,7 @@ class BuildReport(BaseModel):
     environment: str
     out_dir: Path
     zip_path: Path | None = None
+    lockfile_path: Path | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -415,6 +417,7 @@ def build_app(
     *,
     package_zip: bool = False,
     native_python_env: bool = False,
+    write_lock: bool = False,
 ) -> BuildReport:
     """Build one CES app for ``(brand_id, channel, environment)``."""
     core_dir = Path(core_dir).resolve()
@@ -898,12 +901,18 @@ def build_app(
         except (OSError, ValueError, PythonBundlerError) as exc:
             raise BuildError(f"Failed to package {zip_path}: {exc}") from exc
 
+    # 7. Optional canonical SHA-256 sibling lockfile (<out_dir>.lock.json)
+    lockfile_path = None
+    if write_lock:
+        lockfile_path = write_lockfile(out_dir)
+
     return BuildReport(
         brand_id=brand_id,
         channel=channel,
         environment=environment,
         out_dir=out_dir,
         zip_path=zip_path,
+        lockfile_path=lockfile_path,
         warnings=warnings,
     )
 
@@ -916,6 +925,7 @@ def build_all(
     *,
     package_zip: bool = False,
     native_python_env: bool = False,
+    write_locks: bool = False,
 ) -> list[BuildReport]:
     """Build every ``(brand_id, channel)`` pair declared in manifests."""
     core_path = Path(core_dir).resolve()
@@ -943,6 +953,7 @@ def build_all(
                 out_dir=out_dir,
                 package_zip=package_zip,
                 native_python_env=native_python_env,
+                write_lock=write_locks,
             )
             reports.append(rep)
 
