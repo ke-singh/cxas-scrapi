@@ -40,8 +40,8 @@ if TYPE_CHECKING:
 CES_ENV_VAR_PLACEHOLDER = "$env_var"
 _OPENAPI_SERVERS_HEADER_RE = re.compile(r"^servers:\s*(?:#.*)?$")
 _OPENAPI_SERVER_URL_RE = re.compile(r"^(\s*(?:-\s+)?url:\s*)(.+?)\s*$")
-_OPENAPI_LIST_ITEM_RE = re.compile(r"^(\s*)-\s+(.*)$")
-_OPENAPI_KEY_RE = re.compile(r"^(\s*)([A-Za-z0-9_.-]+):")
+_OPENAPI_LIST_ITEM_RE = re.compile(r"^(\s*)-(?:\s+.*)?$")
+_OPENAPI_KEY_RE = re.compile(r"^(\s*(?:-\s+)?)([A-Za-z0-9_.-]+):")
 _CONFIG_SUFFIXES = (".json", ".yaml", ".yml")
 
 
@@ -325,7 +325,10 @@ def _rewrite_openapi_servers_urls(
             continue
 
         indent = len(line) - len(line.lstrip(" "))
-        if indent == 0:
+        is_indent0_seq = indent == 0 and (
+            stripped == "-" or stripped.startswith("- ")
+        )
+        if indent == 0 and not (in_servers and is_indent0_seq):
             in_servers = bool(_OPENAPI_SERVERS_HEADER_RE.match(line))
             in_variables = False
             new_lines.append(line)
@@ -344,7 +347,7 @@ def _rewrite_openapi_servers_urls(
         m_key = _OPENAPI_KEY_RE.match(line)
         if m_key and m_key.group(2) == "variables" and not in_variables:
             in_variables = True
-            vars_indent = indent
+            vars_indent = len(m_key.group(1))
             new_lines.append(line)
             continue
 

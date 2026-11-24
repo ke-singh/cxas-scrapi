@@ -996,16 +996,22 @@ def build_app(
                 has_tokens = (
                     "@@" in text or "{@start" in text or "{@end" in text
                 )
-                if has_tokens:
+                needs_prune_check = bool(
+                    all_disabled_agents or all_disabled_tools
+                ) and ("childAgents" in text or "tools" in text)
+                if has_tokens or needs_prune_check:
                     try:
-                        if "{@start" in text or "{@end" in text:
+                        if has_tokens and (
+                            "{@start" in text or "{@end" in text
+                        ):
                             text = process_conditional_blocks(text)
                         data = yaml.safe_load(text)
                     except (yaml.YAMLError, BuildError) as exc:
                         raise BuildError(f"{path}: {exc}") from exc
+                    pruned = False
                     if isinstance(data, dict):
                         if isinstance(data.get("childAgents"), list):
-                            data["childAgents"] = [
+                            new_children = [
                                 c
                                 for c in data["childAgents"]
                                 if (
@@ -1015,8 +1021,11 @@ def build_app(
                                 )
                                 not in all_disabled_agents
                             ]
+                            if len(new_children) != len(data["childAgents"]):
+                                data["childAgents"] = new_children
+                                pruned = True
                         if isinstance(data.get("tools"), list):
-                            data["tools"] = [
+                            new_tools = [
                                 t
                                 for t in data["tools"]
                                 if (
@@ -1026,16 +1035,30 @@ def build_app(
                                 )
                                 not in all_disabled_tools
                             ]
-                    try:
-                        data = process_json(data)
-                    except BuildError as e:
-                        raise BuildError(f"{path}: {e}") from e
-                    path.write_text(
-                        yaml.safe_dump(
-                            data, sort_keys=False, allow_unicode=True
-                        ),
-                        "utf-8",
-                    )
+                            if len(new_tools) != len(data["tools"]):
+                                data["tools"] = new_tools
+                                pruned = True
+                        elif isinstance(data.get("tools"), dict):
+                            new_tools_map = {
+                                t_key: t_val
+                                for t_key, t_val in data["tools"].items()
+                                if t_key not in all_disabled_tools
+                            }
+                            if len(new_tools_map) != len(data["tools"]):
+                                data["tools"] = new_tools_map
+                                pruned = True
+                    if has_tokens:
+                        try:
+                            data = process_json(data)
+                        except BuildError as e:
+                            raise BuildError(f"{path}: {e}") from e
+                    if has_tokens or pruned:
+                        path.write_text(
+                            yaml.safe_dump(
+                                data, sort_keys=False, allow_unicode=True
+                            ),
+                            "utf-8",
+                        )
 
             elif file.endswith(".py"):
                 text = path.read_text("utf-8")
