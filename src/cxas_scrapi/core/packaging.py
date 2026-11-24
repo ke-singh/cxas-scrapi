@@ -33,6 +33,7 @@ from cxas_scrapi.core.python_bundler import (
 VALID_ARCHIVE_ROOTS: frozenset[str] = frozenset(
     {
         "app.yaml",
+        "app.yml",
         "app.json",
         "global_instruction.txt",
         "environment.json",

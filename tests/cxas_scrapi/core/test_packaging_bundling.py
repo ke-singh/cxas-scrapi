@@ -227,3 +227,21 @@ def test_build_app_bundles_shared_python_and_native_mode(
     with zipfile.ZipFile(rep_native.zip_path) as z:
         assert z.read(cb_rel).decode() == _ENTRYPOINT
         assert "pythonEnvFiles/pythonEnvFiles.yaml" in z.namelist()
+
+
+def test_package_app_archive_includes_app_yml(tmp_path: Path) -> None:
+    app_dir = tmp_path / "yml_app"
+    app_dir.mkdir()
+    app_yml_content = "displayName: Yml App\nrootAgent: root_agent\n"
+    (app_dir / "app.yml").write_text(app_yml_content, encoding="utf-8")
+    (app_dir / "agents" / "root_agent").mkdir(parents=True)
+    (app_dir / "agents" / "root_agent" / "instruction.txt").write_text(
+        "Hello.\n", encoding="utf-8"
+    )
+
+    zip_path = package_app_archive(app_dir, tmp_path / "yml_app.zip")
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        assert "app.yml" in names
+        assert z.read("app.yml").decode("utf-8") == app_yml_content
+        assert "agents/root_agent/instruction.txt" in names
