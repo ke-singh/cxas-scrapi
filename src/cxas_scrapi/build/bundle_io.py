@@ -20,6 +20,8 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+import yaml
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -163,6 +165,27 @@ def load_json_dict_strict(
     return data
 
 
+def load_mapping_strict(
+    path: Path, *, context: str = "config file"
+) -> dict[str, Any]:
+    """Reads a JSON or YAML mapping dict from disk or raises BuildGateError."""
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        raw_text = read_utf8_strict(path, context=context)
+        try:
+            data = yaml.safe_load(raw_text)
+        except yaml.YAMLError as exc:
+            raise BuildGateError(
+                f"Corrupt YAML in {context} {path}: {exc}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise BuildGateError(
+                f"Expected mapping object at root of {context} {path}, "
+                f"got {type(data).__name__}."
+            )
+        return data
+    return load_json_dict_strict(path, context=context)
+
+
 def write_canonical_json(path: Path, payload: dict[str, Any]) -> None:
     """Writes sorted, indented, newline-terminated UTF-8 JSON."""
     if path.is_symlink():
@@ -183,6 +206,7 @@ __all__ = [
     "ResourceDrift",
     "assert_safe_subpath",
     "load_json_dict_strict",
+    "load_mapping_strict",
     "read_utf8_strict",
     "write_canonical_json",
 ]

@@ -35,6 +35,7 @@ from cxas_scrapi.build.bundle_io import (
     ResourceDrift,
     assert_safe_subpath,
     load_json_dict_strict,
+    load_mapping_strict,
     read_utf8_strict,
     write_canonical_json,
 )
@@ -75,9 +76,54 @@ CES_SERVER_DEFAULT_APP_VALUES: dict[str, Any] = {
 # moves the concrete URL into environment.json (`tools.<name>.openApiTool.url`).
 CES_ENV_VAR_PLACEHOLDER = "$env_var"
 _OPENAPI_SERVER_URL_RE = re.compile(r"^(\s*-\s*url:\s*)\S.*$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+_CONFIG_EXTS = (".json", ".yaml", ".yml")
+_OPENAPI_SCHEMA_FILENAMES = frozenset(
+    {"open_api_schema.yaml", "open_api_schema.yml"}
+)
 
 DriftStatus = Literal["CLEAN", "DRIFT", "ORPHAN", "CONFLICT"]
 ResolutionMode = Literal["accept-live", "force-ours"]
+
+
+def _paths_overlap(a: Path, b: Path) -> bool:
+    """Return True if ``a`` and ``b`` are equal or nested inside each other."""
+    ra, rb = a.resolve(), b.resolve()
+    return ra == rb or ra in rb.parents or rb in ra.parents
+
+
+def _find_config_file(
+    directory: Path,
+    stem: str,
+    root: Path,
+    *,
+    fallback_any: bool = False,
+    exclude_names: frozenset[str] = frozenset(),
+    label: str = "app bundle",
+) -> Path | None:
+    """Locate ``<stem>.{json,yaml,yml}`` (or fallback config) safely."""
+    for ext in _CONFIG_EXTS:
+        cand = directory / f"{stem}{ext}"
+        if cand.is_symlink():
+            raise BuildGateError(
+                f"Symlinks are not permitted in {label}: {cand}"
+            )
+        if cand.is_file():
+            assert_safe_subpath(cand, root, label=label)
+            return cand
+    if fallback_any:
+        for ext in _CONFIG_EXTS:
+            for cand in sorted(directory.glob(f"*{ext}")):
+                if cand.name in exclude_names:
+                    continue
+                if cand.is_symlink():
+                    raise BuildGateError(
+                        f"Symlinks are not permitted in {label}: {cand}"
+                    )
+                if cand.is_file():
+                    assert_safe_subpath(cand, root, label=label)
+                    return cand
+    return None
 
 
 def _validate_safe_identifier(value: str, *, label: str) -> str:
@@ -253,21 +299,18 @@ def extract_normalized_resources(
 
     resources: dict[str, NormalizedResource] = {}
 
-    app_json_path = root / "app.json"
+    app_cfg_path = _find_config_file(root, "app", root, label="app bundle")
     global_instr_path = root / "global_instruction.txt"
-    for top_file in (app_json_path, global_instr_path):
-        if top_file.is_symlink():
-            raise BuildGateError(
-                f"Symlinks are not permitted in app bundle: {top_file}"
-            )
-    if app_json_path.is_file() or global_instr_path.is_file():
-        if app_json_path.is_file():
-            assert_safe_subpath(app_json_path, root, label="app bundle")
+    if global_instr_path.is_symlink():
+        raise BuildGateError(
+            f"Symlinks are not permitted in app bundle: {global_instr_path}"
+        )
+    if app_cfg_path is not None or global_instr_path.is_file():
         if global_instr_path.is_file():
             assert_safe_subpath(global_instr_path, root, label="app bundle")
         raw_app = (
-            load_json_dict_strict(app_json_path, context="app.json")
-            if app_json_path.is_file()
+            load_mapping_strict(app_cfg_path, context=app_cfg_path.name)
+            if app_cfg_path is not None
             else {}
         )
         norm_app = _normalize_app_obj(raw_app)
@@ -297,22 +340,17 @@ def extract_normalized_resources(
             if entry.is_dir():
                 dir_name = entry.name
                 res_id = f"{category}/{dir_name}"
-                primary_json = entry / f"{dir_name}.json"
-                if primary_json.is_symlink():
-                    raise BuildGateError(
-                        f"Symlinks are not permitted in {res_id}: "
-                        f"{primary_json}"
-                    )
-                if not primary_json.is_file():
-                    candidates = sorted(entry.glob("*.json"))
-                    primary_json = candidates[0] if candidates else primary_json
-                if primary_json.is_symlink() or primary_json.is_file():
-                    assert_safe_subpath(primary_json, root, label=res_id)
+                primary_cfg = _find_config_file(
+                    entry,
+                    dir_name,
+                    root,
+                    fallback_any=True,
+                    exclude_names=_OPENAPI_SCHEMA_FILENAMES,
+                    label=res_id,
+                )
                 raw_obj = (
-                    load_json_dict_strict(
-                        primary_json, context=f"{res_id} JSON"
-                    )
-                    if primary_json.is_file()
+                    load_mapping_strict(primary_cfg, context=f"{res_id} config")
+                    if primary_cfg is not None
                     else {}
                 )
                 norm_obj = normalize_json_obj(raw_obj, is_root=True)
@@ -351,13 +389,17 @@ def extract_normalized_resources(
                     if oa_file.is_symlink() or oa_file.is_file():
                         assert_safe_subpath(oa_file, root, label=res_id)
                     if oa_file.is_file():
-                        norm_obj["_openApiSchemaLines"] = (
-                            _canonical_openapi_schema_lines(
-                                read_utf8_strict(
-                                    oa_file, context=f"{res_id} OpenAPI schema"
-                                )
-                            )
+                        oa_raw = read_utf8_strict(
+                            oa_file, context=f"{res_id} OpenAPI schema"
                         )
+                        if isinstance(oa_cfg, dict) and "url" in oa_cfg:
+                            norm_obj["_openApiSchemaLines"] = (
+                                _canonical_openapi_schema_lines(oa_raw)
+                            )
+                        else:
+                            norm_obj["_openApiSchemaLines"] = oa_raw.replace(
+                                "\r\n", "\n"
+                            ).splitlines()
 
                 py_files = _walk_safe_py_files(entry, root)
                 if py_files:
@@ -387,9 +429,9 @@ def extract_normalized_resources(
 
                 resources[res_id] = _make_normalized_resource(res_id, norm_obj)
 
-            elif entry.is_file() and entry.suffix == ".json":
+            elif entry.is_file() and entry.suffix.lower() in _CONFIG_EXTS:
                 res_id = f"{category}/{entry.stem}"
-                raw_obj = load_json_dict_strict(entry, context=f"{res_id} JSON")
+                raw_obj = load_mapping_strict(entry, context=f"{res_id} config")
                 norm_obj = normalize_json_obj(raw_obj, is_root=True)
                 resources[res_id] = _make_normalized_resource(res_id, norm_obj)
 
@@ -453,22 +495,30 @@ def _load_lockfile_resources(
     if not lockfile_path.is_file():
         return {}
     data = load_json_dict_strict(lockfile_path, context="lockfile")
-    raw_res = data.get("resources", {})
-    if not isinstance(raw_res, dict):
+    if data.get("schema_version") != "1.0":
         raise BuildGateError(
-            f"Invalid lockfile {lockfile_path}: 'resources' must be an object."
+            f"Unsupported or missing schema_version in lockfile "
+            f"{lockfile_path}: expected '1.0', got "
+            f"{data.get('schema_version')!r}."
         )
+    if "resources" not in data or not isinstance(data["resources"], dict):
+        raise BuildGateError(
+            f"Invalid lockfile {lockfile_path}: 'resources' must be present "
+            "and be a JSON object."
+        )
+    raw_res = data["resources"]
     loaded: dict[str, NormalizedResource] = {}
     for res_id, entry in raw_res.items():
         _validate_safe_identifier(str(res_id), label="lockfile resource_id")
         if (
             not isinstance(entry, dict)
             or not isinstance(entry.get("sha256"), str)
-            or not entry["sha256"].strip()
+            or not _SHA256_HEX_RE.fullmatch(entry["sha256"])
         ):
             raise BuildGateError(
                 f"Invalid lockfile {lockfile_path}: resource {res_id!r} "
-                "must be an object containing a non-empty string 'sha256'."
+                "must be an object containing a 64-character lowercase hex "
+                "'sha256'."
             )
         raw_norm = entry.get("normalized", "")
         if not isinstance(raw_norm, str):
@@ -873,12 +923,22 @@ def _adopt_live_resource_into_ours(
                             ours_bundle, parsed_modules, mod_packages
                         )
                 else:
-                    dst_file.write_text(
-                        read_utf8_strict(
-                            src_file, context=f"live {res_id} file"
-                        ).replace("\r\n", "\n"),
-                        encoding="utf-8",
-                    )
+                    try:
+                        raw_bytes = src_file.read_bytes()
+                    except OSError as exc:
+                        raise BuildGateError(
+                            f"Failed to read live {res_id} file "
+                            f"{src_file}: {exc}"
+                        ) from exc
+                    try:
+                        text = raw_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        dst_file.write_bytes(raw_bytes)
+                    else:
+                        dst_file.write_text(
+                            text.replace("\r\n", "\n"),
+                            encoding="utf-8",
+                        )
     elif live_flat_json.is_file():
         assert_safe_subpath(live_flat_json, live_bundle, label="live bundle")
         ours_item_dir.mkdir(parents=True, exist_ok=True)
@@ -889,12 +949,50 @@ def _adopt_live_resource_into_ours(
         write_canonical_json(ours_item_dir / f"{item_name}.json", norm_obj)
 
 
+def _validate_git_mirror_dir(mirror_dir: Path) -> None:
+    """Refuse to overwrite dirty git repos or non-empty non-git directories."""
+    if (mirror_dir / ".git").exists():
+        env = dict(os.environ)
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        try:
+            proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=str(mirror_dir),
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip()
+            raise BuildGateError(
+                f"Failed to inspect git_mirror repository {mirror_dir}: "
+                f"{stderr}"
+            ) from exc
+        if proc.stdout.strip():
+            raise BuildGateError(
+                "Refusing to write git_mirror into a dirty git repository "
+                f"with uncommitted or untracked changes: {mirror_dir}"
+            )
+    elif mirror_dir.exists():
+        if not mirror_dir.is_dir():
+            raise BuildGateError(
+                f"git_mirror path exists and is not a directory: {mirror_dir}"
+            )
+        if any(mirror_dir.iterdir()):
+            raise BuildGateError(
+                "Refusing to initialize git_mirror in a non-empty non-git "
+                f"directory: {mirror_dir}"
+            )
+
+
 def _commit_live_git_mirror(
     mirror_dir: Path,
     app_id: str,
     live_resources: dict[str, NormalizedResource],
 ) -> str:
     _validate_safe_identifier(app_id, label="app_id")
+    _validate_git_mirror_dir(mirror_dir)
     mirror_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["GIT_CONFIG_NOSYSTEM"] = "1"
@@ -1046,6 +1144,32 @@ def check_drift(
         eff_conflicts_dir = (
             ours_bundle.parent / "conflicts" / app_id
         ).resolve()
+
+    if _paths_overlap(eff_conflicts_dir, ours_bundle) or _paths_overlap(
+        eff_conflicts_dir, live_bundle
+    ):
+        raise BuildGateError(
+            f"conflicts_dir ({eff_conflicts_dir}) must not overlap with "
+            "ours or live app bundle directories."
+        )
+
+    eff_mirror = git_mirror if git_mirror is not None else git_mirror_dir
+    resolved_mirror: Path | None = None
+    if eff_mirror is not None:
+        raw_mirror = Path(eff_mirror)
+        if raw_mirror.is_symlink():
+            raise BuildGateError(
+                f"Symlinks are not permitted as git_mirror: {raw_mirror}"
+            )
+        resolved_mirror = raw_mirror.resolve()
+        if _paths_overlap(resolved_mirror, ours_bundle) or _paths_overlap(
+            resolved_mirror, live_bundle
+        ):
+            raise BuildGateError(
+                f"git_mirror ({resolved_mirror}) must not overlap with "
+                "ours or live app bundle directories."
+            )
+        _validate_git_mirror_dir(resolved_mirror)
 
     base_map = _load_lockfile_resources(resolved_lock)
     ours_map = extract_normalized_resources(ours_bundle)
@@ -1209,16 +1333,10 @@ def check_drift(
                 _restore_bundle_backup(backup_bundle, ours_bundle)
             raise
 
-    eff_mirror = git_mirror if git_mirror is not None else git_mirror_dir
     mirror_commit: str | None = None
-    if eff_mirror is not None:
-        raw_mirror = Path(eff_mirror)
-        if raw_mirror.is_symlink():
-            raise BuildGateError(
-                f"Symlinks are not permitted as git_mirror: {raw_mirror}"
-            )
+    if resolved_mirror is not None:
         mirror_commit = _commit_live_git_mirror(
-            raw_mirror.resolve(), app_id, live_map
+            resolved_mirror, app_id, live_map
         )
 
     return DriftReport(

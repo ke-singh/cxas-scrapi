@@ -880,6 +880,13 @@ def inspect_entrypoint_bundle(
     if had_bundle or app_dir is None:
         return new_content, digest, parsed_modules, packages
 
+    try:
+        ast.parse(content, filename=str(ep_path))
+    except SyntaxError as exc:
+        raise PythonBundlerError(
+            f"Entrypoint {ep_path} is not valid Python: {exc}"
+        ) from exc
+
     available_modules, module_paths, all_packages = _discover_shared_modules(
         Path(app_dir).resolve()
     )
