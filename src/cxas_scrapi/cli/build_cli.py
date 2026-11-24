@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 def app_build(args: argparse.Namespace) -> None:
     """Handle `cxas build`."""
+    composition_mode = getattr(args, "composition_mode", None)
     try:
         if args.all:
             reports = build_all(
@@ -39,6 +40,7 @@ def app_build(args: argparse.Namespace) -> None:
                 out_root=args.out,
                 environment=args.env,
                 package_zip=args.zip,
+                composition_mode=composition_mode,
             )
             if args.json:
                 print(json.dumps([r.model_dump(mode="json") for r in reports]))
@@ -65,6 +67,7 @@ def app_build(args: argparse.Namespace) -> None:
                 environment=args.env,
                 out_dir=args.out,
                 package_zip=args.zip,
+                composition_mode=composition_mode,
             )
             if args.json:
                 print(report.model_dump_json())
@@ -126,6 +129,15 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     parser_build.add_argument(
         "--zip", action="store_true", help="Package each built app to a ZIP."
+    )
+    parser_build.add_argument(
+        "--composition-mode",
+        choices=["canonical_overlay", "brand_native"],
+        default=None,
+        help=(
+            "Override the brand's composition_mode "
+            "(canonical_overlay or brand_native)."
+        ),
     )
     parser_build.add_argument(
         "--json", action="store_true", help="Emit JSON build report(s)."
