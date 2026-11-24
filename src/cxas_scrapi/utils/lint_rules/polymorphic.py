@@ -19,12 +19,14 @@ P001 and P004 use build brand context: brand and channel are read from the
 bundle's ``deployments/*.yaml`` (emitted by ``cxas build``) unless given via
 ``cxas lint --brand/--channel``; manifests come from ``--manifests-dir``, or
 ``<app>/manifests`` / ``<project>/manifests`` when present. Without brand
-context those two rules are skipped cleanly.
+context (and when no explicit ``--manifests-dir`` / ``--brand`` / ``--channel``
+was supplied), those two rules are skipped cleanly.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
     from cxas_scrapi.build.manifests import ChannelCapabilities, Manifests
 
 _TEXT_SUFFIXES = (".txt", ".json", ".yaml", ".yml", ".py")
+_CONFIG_SUFFIXES = (".json", ".yaml", ".yml")
 # Build metadata written by `cxas build`; never pushed (not an archive root).
 _NON_APP_DIRS = frozenset({"deployments", "evals", "manifests"})
 
@@ -56,7 +59,9 @@ _DANGLING_PLACEHOLDER_RE = re.compile(
 _UNRESOLVED_COND_TAG_RE = re.compile(
     r"\{@(?:start|end)(?:Channel|Brand|AgentEnabled|ToolEnabled)_[^}]+\}"
 )
-_INSTRUCTION_REF_RE = re.compile(r"\{@(AGENT|TOOL):\s*([^}]+?)\s*\}")
+_INSTRUCTION_REF_RE = re.compile(
+    r"\{@(AGENT|TOOL)[:\s]+([^}]+?)\s*\}", re.IGNORECASE
+)
 
 # Model values CES does not treat as a pinned GA model.
 MODEL_ALIASES: frozenset[str] = frozenset({"default", "latest", "auto"})
@@ -84,12 +89,66 @@ def _read(path: Path) -> str:
         return ""
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _load_config(path: Path) -> dict[str, Any]:
+    """Load a JSON or YAML mapping file, returning ``{}`` on error/non-dict."""
+    if not path.is_file():
+        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        text = path.read_text(encoding="utf-8")
+        if path.suffix.lower() in (".yaml", ".yml"):
+            data = yaml.safe_load(text)
+        else:
+            data = json.loads(text)
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _find_app_config(app_root: Path) -> Path | None:
+    for suffix in _CONFIG_SUFFIXES:
+        candidate = app_root / f"app{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _find_resource_config(res_dir: Path) -> Path | None:
+    """Find ``<res_dir>/<res_dir.name>.{json,yaml,yml}`` (preferring JSON)."""
+    for suffix in _CONFIG_SUFFIXES:
+        candidate = res_dir / f"{res_dir.name}{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _iter_resource_configs(app_root: Path, subdir: str) -> Iterator[Path]:
+    """Yield one config path per resource dir under ``app_root/subdir``."""
+    base = app_root / subdir
+    if not base.is_dir():
+        return
+    for res_dir in sorted(base.iterdir()):
+        if not res_dir.is_dir():
+            continue
+        cfg = _find_resource_config(res_dir)
+        if cfg is not None:
+            yield cfg
+
+
+def _iter_guardrail_configs(app_root: Path) -> Iterator[Path]:
+    """Yield guardrail config files under ``app_root/guardrails/*/``."""
+    base = app_root / "guardrails"
+    if not base.is_dir():
+        return
+    for gr_dir in sorted(base.iterdir()):
+        if not gr_dir.is_dir():
+            continue
+        preferred = _find_resource_config(gr_dir)
+        if preferred is not None:
+            yield preferred
+            continue
+        for path in sorted(gr_dir.iterdir()):
+            if path.is_file() and path.suffix.lower() in _CONFIG_SUFFIXES:
+                yield path
 
 
 def _rel(path: Path, context: LintContext) -> str:
@@ -107,46 +166,141 @@ def _deployment_metadata(app_root: Path) -> tuple[str | None, str | None]:
     for dep in sorted(app_root.glob("deployments/*.yaml")):
         try:
             data = yaml.safe_load(dep.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
             continue
-        if isinstance(data, dict) and data.get("brandId"):
-            return data.get("brandId"), data.get("channel")
+        if not isinstance(data, dict):
+            continue
+        raw_brand = data.get("brandId")
+        raw_channel = data.get("channel")
+        if isinstance(raw_brand, str) and raw_brand.strip():
+            channel = (
+                raw_channel.strip()
+                if isinstance(raw_channel, str) and raw_channel.strip()
+                else None
+            )
+            return raw_brand.strip(), channel
     return None, None
 
 
-def resolve_brand_context(
+def _resolve_brand_context_checked(
     context: LintContext,
-) -> tuple[Manifests | None, str | None, str | None]:
-    """Returns (manifests, brand_id, channel) or Nones when unavailable."""
+) -> tuple[Manifests | None, str | None, str | None, str | None]:
+    """Resolve ``(manifests, brand_id, channel, error_message)``.
+
+    Explicitly supplied ``--manifests-dir``, ``--brand``, or ``--channel``
+    flags never silently fall back or skip when missing/invalid; they return a
+    non-None ``error_message`` so callers fail loudly.
+    """
     from cxas_scrapi.build.manifests import (  # noqa: PLC0415
         ManifestError,
         load_manifests,
     )
 
     app_root = context.app_root or context.project_root
-    brand, channel = context.brand_id, context.channel
-    if not brand or not channel:
-        dep_brand, dep_channel = _deployment_metadata(app_root)
-        brand = brand or dep_brand
-        channel = channel or dep_channel
-
-    candidates = [
-        context.manifests_dir,
-        app_root / "manifests",
-        context.project_root / "manifests",
-    ]
-    manifests_dir = next(
-        (c for c in candidates if c is not None and Path(c).is_dir()), None
+    dep_brand, dep_channel = _deployment_metadata(app_root)
+    explicit_brand = (
+        context.brand_id
+        if isinstance(context.brand_id, str) and context.brand_id.strip()
+        else None
     )
-    if manifests_dir is None or not brand:
-        return None, brand, channel
-    try:
-        manifests = load_manifests(manifests_dir)
-    except ManifestError:
-        return None, brand, channel
+    explicit_channel = (
+        context.channel
+        if isinstance(context.channel, str) and context.channel.strip()
+        else None
+    )
+    brand = explicit_brand or dep_brand
+    channel = explicit_channel or dep_channel
+
+    if context.manifests_dir is not None:
+        manifests_dir = Path(context.manifests_dir)
+        if not manifests_dir.is_dir():
+            return (
+                None,
+                brand,
+                channel,
+                f"Manifests directory not found: {manifests_dir}",
+            )
+        try:
+            manifests = load_manifests(manifests_dir)
+        except ManifestError as exc:
+            return (
+                None,
+                brand,
+                channel,
+                f"Failed to load manifests from '{manifests_dir}': {exc}",
+            )
+    else:
+        auto_candidates = [
+            app_root / "manifests",
+            context.project_root / "manifests",
+        ]
+        manifests_dir = next((c for c in auto_candidates if c.is_dir()), None)
+        if manifests_dir is None:
+            if explicit_brand or explicit_channel:
+                return (
+                    None,
+                    brand,
+                    channel,
+                    "--brand/--channel specified but no manifests directory "
+                    "was found (pass --manifests-dir).",
+                )
+            return None, brand, channel, None
+        try:
+            manifests = load_manifests(manifests_dir)
+        except ManifestError as exc:
+            if explicit_brand or explicit_channel:
+                return (
+                    None,
+                    brand,
+                    channel,
+                    f"Failed to load manifests from '{manifests_dir}': {exc}",
+                )
+            return None, brand, channel, None
+
+    if not brand:
+        if context.manifests_dir is not None or explicit_channel:
+            return (
+                None,
+                None,
+                channel,
+                "Could not determine brand ID from deployments/*.yaml "
+                "(pass --brand).",
+            )
+        return None, None, channel, None
+
     if brand not in manifests.brands:
-        return None, brand, channel
+        if explicit_brand or context.manifests_dir is not None:
+            return (
+                None,
+                brand,
+                channel,
+                f"Unknown brand '{brand}'. Known brands: "
+                f"{sorted(manifests.brands)}",
+            )
+        return None, brand, channel, None
+
+    return manifests, brand, channel, None
+
+
+def resolve_brand_context(
+    context: LintContext,
+) -> tuple[Manifests | None, str | None, str | None]:
+    """Returns (manifests, brand_id, channel) or Nones when unavailable."""
+    manifests, brand, channel, _err = _resolve_brand_context_checked(context)
     return manifests, brand, channel
+
+
+def _parse_positive_int(raw: Any, default: int) -> int:
+    """Parse a strictly positive integer option, rejecting bools/infinities."""
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, float) and not math.isfinite(raw):
+        return default
+    try:
+        val = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return val if val > 0 else default
 
 
 @rule("structure")
@@ -165,7 +319,20 @@ class BrandTokenLeak(Rule):
     def check(
         self, file_path: Path, content: str, context: LintContext
     ) -> list[LintResult]:
-        manifests, brand_id, _ = resolve_brand_context(context)
+        manifests, brand_id, _, ctx_err = _resolve_brand_context_checked(
+            context
+        )
+        if ctx_err:
+            return [
+                self.make_result(
+                    file=_rel(file_path, context),
+                    message=ctx_err,
+                    fix=(
+                        "Pass a valid --manifests-dir and --brand matching "
+                        "manifests/brands/."
+                    ),
+                )
+            ]
         if manifests is None or brand_id is None:
             return []
         brand = manifests.brand(brand_id)
@@ -233,22 +400,17 @@ class AgentToolCountCap(Rule):
         raw_cap = (
             raw_opts.get("max_tools", 20) if isinstance(raw_opts, dict) else 20
         )
-        try:
-            max_tools = int(raw_cap)
-        except (TypeError, ValueError):
-            max_tools = 20
+        max_tools = _parse_positive_int(raw_cap, default=20)
         app_root = context.app_root or file_path.parent
         results: list[LintResult] = []
-        for agent_json in sorted(app_root.glob("agents/*/*.json")):
-            if agent_json.stem != agent_json.parent.name:
-                continue
-            tools = _load_json(agent_json).get("tools") or []
+        for agent_cfg in _iter_resource_configs(app_root, "agents"):
+            tools = _load_config(agent_cfg).get("tools")
             if isinstance(tools, list) and len(tools) > max_tools:
                 results.append(
                     self.make_result(
-                        file=_rel(agent_json, context),
+                        file=_rel(agent_cfg, context),
                         message=(
-                            f"Agent '{agent_json.stem}' references "
+                            f"Agent '{agent_cfg.stem}' references "
                             f"{len(tools)} tools (cap {max_tools})."
                         ),
                         fix="Split the agent or move tools into toolsets.",
@@ -325,14 +487,52 @@ class PrunedResourcesAbsent(Rule):
     def check(
         self, file_path: Path, content: str, context: LintContext
     ) -> list[LintResult]:
-        manifests, brand_id, channel = resolve_brand_context(context)
-        if manifests is None or brand_id is None or channel is None:
+        manifests, brand_id, channel, ctx_err = _resolve_brand_context_checked(
+            context
+        )
+        if ctx_err:
+            return [
+                self.make_result(
+                    file=_rel(file_path, context),
+                    message=ctx_err,
+                    fix=(
+                        "Pass a valid --manifests-dir, --brand, and --channel "
+                        "matching manifests/brands/."
+                    ),
+                )
+            ]
+        if manifests is None or brand_id is None:
+            return []
+        if channel is None:
+            if context.channel is not None:
+                return [
+                    self.make_result(
+                        file=_rel(file_path, context),
+                        message="Channel must be a non-empty string.",
+                        fix="Pass a valid --channel from channel_policy.yaml.",
+                    )
+                ]
             return []
         policy = manifests.policies.get(brand_id)
         caps: ChannelCapabilities | None = (
             policy.channels.get(channel) if policy else None
         )
         if caps is None:
+            if context.channel is not None:
+                known = sorted(policy.channels) if policy else []
+                return [
+                    self.make_result(
+                        file=_rel(file_path, context),
+                        message=(
+                            f"Unknown channel '{channel}' for brand "
+                            f"'{brand_id}'. Known channels: {known}"
+                        ),
+                        fix=(
+                            "Pass a valid --channel declared in "
+                            "channel_policy.yaml."
+                        ),
+                    )
+                ]
             return []
         disabled = {
             "agent": set(caps.disabled_agents),
@@ -356,12 +556,19 @@ class PrunedResourcesAbsent(Rule):
             )
 
         for kind, sub in (("agent", "agents"), ("tool", "tools")):
-            for res_dir in sorted(app_root.glob(f"{sub}/*")):
+            sub_dir = app_root / sub
+            if not sub_dir.is_dir():
+                continue
+            for res_dir in sorted(sub_dir.iterdir()):
                 if not res_dir.is_dir():
                     continue
-                display = _load_json(res_dir / f"{res_dir.name}.json").get(
-                    "displayName", ""
+                cfg_path = _find_resource_config(res_dir)
+                raw_display = (
+                    _load_config(cfg_path).get("displayName")
+                    if cfg_path is not None
+                    else None
                 )
+                display = raw_display if isinstance(raw_display, str) else ""
                 if res_dir.name in disabled[kind] or display in disabled[kind]:
                     _flag(
                         res_dir,
@@ -369,45 +576,59 @@ class PrunedResourcesAbsent(Rule):
                         f"disabled for {brand_id}/{channel} but present.",
                     )
 
-        app_json = app_root / "app.json"
-        if app_json.is_file():
-            root_agent = _load_json(app_json).get("rootAgent")
+        app_cfg = _find_app_config(app_root)
+        if app_cfg is not None:
+            root_agent = _load_config(app_cfg).get("rootAgent")
             if isinstance(root_agent, str) and root_agent in disabled["agent"]:
                 _flag(
-                    app_json,
+                    app_cfg,
                     f"rootAgent references disabled agent '{root_agent}'.",
                 )
 
         env_json = app_root / "environment.json"
         if env_json.is_file():
-            env_tools = _load_json(env_json).get("tools")
+            env_tools = _load_config(env_json).get("tools")
             if isinstance(env_tools, dict):
                 for tool_name in sorted(env_tools):
-                    if tool_name in disabled["tool"]:
+                    if (
+                        isinstance(tool_name, str)
+                        and tool_name in disabled["tool"]
+                    ):
                         _flag(
                             env_json,
                             f"environment.json references disabled tool "
                             f"'{tool_name}'.",
                         )
 
-        for agent_json in sorted(app_root.glob("agents/*/*.json")):
-            if agent_json.stem != agent_json.parent.name:
-                continue
-            data = _load_json(agent_json)
-            for ref in data.get("tools") or []:
-                ref_name = (
-                    ref.get("displayName") if isinstance(ref, dict) else ref
-                )
-                if isinstance(ref_name, str) and ref_name in disabled["tool"]:
-                    _flag(agent_json, f"References disabled tool '{ref_name}'.")
-            for ref in data.get("childAgents") or []:
-                ref_name = (
-                    ref.get("displayName") if isinstance(ref, dict) else ref
-                )
-                if isinstance(ref_name, str) and ref_name in disabled["agent"]:
-                    _flag(
-                        agent_json, f"References disabled agent '{ref_name}'."
+        for agent_cfg in _iter_resource_configs(app_root, "agents"):
+            data = _load_config(agent_cfg)
+            tools = data.get("tools")
+            if isinstance(tools, list):
+                for ref in tools:
+                    ref_name = (
+                        ref.get("displayName") if isinstance(ref, dict) else ref
                     )
+                    if (
+                        isinstance(ref_name, str)
+                        and ref_name in disabled["tool"]
+                    ):
+                        _flag(
+                            agent_cfg, f"References disabled tool '{ref_name}'."
+                        )
+            child_agents = data.get("childAgents")
+            if isinstance(child_agents, list):
+                for ref in child_agents:
+                    ref_name = (
+                        ref.get("displayName") if isinstance(ref, dict) else ref
+                    )
+                    if (
+                        isinstance(ref_name, str)
+                        and ref_name in disabled["agent"]
+                    ):
+                        _flag(
+                            agent_cfg,
+                            f"References disabled agent '{ref_name}'.",
+                        )
 
         for path in _iter_app_text_files(app_root):
             if path.suffix != ".txt":
@@ -436,22 +657,21 @@ def _extract_model_value(holder: Any) -> Any:
 
 def _model_slots(app_root: Path) -> Iterator[tuple[Path, str, Any, bool]]:
     """Yields (file, slot, model_value, required) for CES-applied slots."""
-    app = _load_json(app_root / "app.json")
+    app_cfg = _find_app_config(app_root)
+    app = _load_config(app_cfg) if app_cfg is not None else {}
     app_model = _extract_model_value(app)
-    if app_model is not None:
-        yield app_root / "app.json", "app modelSettings", app_model, True
-    for agent_json in sorted(app_root.glob("agents/*/*.json")):
-        if agent_json.stem != agent_json.parent.name:
-            continue
-        model = _extract_model_value(_load_json(agent_json))
+    if app_cfg is not None and app_model is not None:
+        yield app_cfg, "app modelSettings", app_model, True
+    for agent_cfg in _iter_resource_configs(app_root, "agents"):
+        model = _extract_model_value(_load_config(agent_cfg))
         yield (
-            agent_json,
-            f"agent '{agent_json.stem}' modelSettings",
+            agent_cfg,
+            f"agent '{agent_cfg.stem}' modelSettings",
             model,
             app_model is None,
         )
-    for gr_json in sorted(app_root.glob("guardrails/*/*.json")):
-        data = _load_json(gr_json)
+    for gr_cfg in _iter_guardrail_configs(app_root):
+        data = _load_config(gr_cfg)
         holders = []
         if isinstance(data.get("llmPolicy"), dict):
             holders.append(("llmPolicy", data["llmPolicy"]))
@@ -462,18 +682,19 @@ def _model_slots(app_root: Path) -> Iterator[tuple[Path, str, Any, bool]]:
             )
         for label, holder in holders:
             yield (
-                gr_json,
+                gr_cfg,
                 f"guardrail {label}",
                 _extract_model_value(holder),
                 True,
             )
-    for tool_json in sorted(app_root.glob("tools/*/*.json")):
-        if tool_json.stem != tool_json.parent.name:
-            continue
-        ds = _load_json(tool_json).get("dataStoreTool")
+    for tool_cfg in _iter_resource_configs(app_root, "tools"):
+        ds = _load_config(tool_cfg).get("dataStoreTool")
         if not isinstance(ds, dict):
             continue
-        for cfg in ds.get("modalityConfigs") or []:
+        modality_configs = ds.get("modalityConfigs")
+        if not isinstance(modality_configs, list):
+            continue
+        for cfg in modality_configs:
             if not isinstance(cfg, dict):
                 continue
             for key in ("rewriterConfig", "summarizationConfig"):
@@ -481,7 +702,7 @@ def _model_slots(app_root: Path) -> Iterator[tuple[Path, str, Any, bool]]:
                 if not isinstance(sub, dict) or sub.get("disabled") is True:
                     continue
                 yield (
-                    tool_json,
+                    tool_cfg,
                     f"data store {cfg.get('modalityType', '?')} {key}",
                     _extract_model_value(sub),
                     True,

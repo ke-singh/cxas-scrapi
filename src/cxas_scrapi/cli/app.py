@@ -403,16 +403,64 @@ def app_push(args: argparse.Namespace) -> str | None:
     )
 
 
-def _bundle_declares_lock(app_dir: str) -> bool:
-    """True when the local app.json declares the governed lock."""
-    app_json = Path(app_dir) / "app.json"
-    if not app_json.is_file():
-        return False
+def _find_app_config_file(app_dir: Path) -> Path | None:
+    """Return the app's root config file (app.json, app.yaml, or app.yml)."""
+    for name in ("app.json", "app.yaml", "app.yml"):
+        candidate = app_dir / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _bundle_lock_policy(app_dir: str) -> bool | None:
+    """Return explicit governed lock policy (`True`/`False`) or `None`."""
+    cfg = _find_app_config_file(Path(app_dir))
+    if cfg is None:
+        return None
     try:
-        data = json.loads(app_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return isinstance(data, dict) and data.get("locked") is True
+        text = cfg.read_text(encoding="utf-8")
+        if cfg.suffix.lower() in (".yaml", ".yml"):
+            import yaml  # noqa: PLC0415
+
+            data = yaml.safe_load(text)
+        else:
+            data = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw_locked = data.get("locked")
+    return raw_locked if isinstance(raw_locked, bool) else None
+
+
+def _bundle_declares_lock(app_dir: str) -> bool:
+    """True when the local app config declares ``locked: true``."""
+    return _bundle_lock_policy(app_dir) is True
+
+
+def _clear_staged_app_lock(staged_dir: Path) -> None:
+    """Set ``locked: false`` in staged ``app.json`` / ``app.yaml`` for import."""
+    cfg = _find_app_config_file(staged_dir)
+    if cfg is None:
+        return
+    text = cfg.read_text(encoding="utf-8")
+    if cfg.suffix.lower() in (".yaml", ".yml"):
+        import yaml  # noqa: PLC0415
+
+        staged_data = yaml.safe_load(text)
+        if isinstance(staged_data, dict):
+            staged_data["locked"] = False
+            cfg.write_text(
+                yaml.safe_dump(staged_data, sort_keys=False), encoding="utf-8"
+            )
+    else:
+        staged_data = json.loads(text)
+        if isinstance(staged_data, dict):
+            staged_data["locked"] = False
+            cfg.write_text(
+                json.dumps(staged_data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
 
 
 def _is_app_locked(apps_client: Apps | None, app_name: str) -> bool:
@@ -443,6 +491,7 @@ def _app_push(
 
     valid_roots = [
         "app.yaml",
+        "app.yml",
         "app.json",
         "global_instruction.txt",
         "environment.json",
@@ -457,7 +506,7 @@ def _app_push(
         ".github/workflows",
     ]
 
-    desired_lock = _bundle_declares_lock(app_dir)
+    desired_lock = _bundle_lock_policy(app_dir)
     was_locked = bool(target_app_name) and _is_app_locked(
         apps_client, target_app_name
     )
@@ -465,10 +514,16 @@ def _app_push(
 
     try:
         if was_locked:
-            print(
-                f"Target app {target_app_name} is locked; unlocking it for "
-                "import (it will be re-locked afterwards)..."
-            )
+            if desired_lock is False:
+                print(
+                    f"Target app {target_app_name} is locked; unlocking it "
+                    "(bundle declares locked=false)..."
+                )
+            else:
+                print(
+                    f"Target app {target_app_name} is locked; unlocking it for "
+                    "import (it will be re-locked afterwards)..."
+                )
             apps_client.update_app(target_app_name, locked=False)
             relock_target = target_app_name
 
@@ -482,19 +537,8 @@ def _app_push(
                 else:
                     shutil.copy2(src_path, dst_path)
 
-        if desired_lock:
-            staged_app_json = Path(inner_dir) / "app.json"
-            if staged_app_json.is_file():
-                staged_data = json.loads(
-                    staged_app_json.read_text(encoding="utf-8")
-                )
-                if isinstance(staged_data, dict):
-                    staged_data["locked"] = False
-                    staged_app_json.write_text(
-                        json.dumps(staged_data, indent=2, ensure_ascii=False)
-                        + "\n",
-                        encoding="utf-8",
-                    )
+        if desired_lock is True:
+            _clear_staged_app_lock(Path(inner_dir))
             print(
                 "Bundle declares locked=true (governed lock): importing with "
                 "locked=false and applying the lock after import."
@@ -583,7 +627,10 @@ def _app_push(
         app_name = _handle_import_result(
             result, "pushed to" if identifier else "pushed"
         )
-        if desired_lock and app_name:
+        should_lock_after = desired_lock is True or (
+            desired_lock is None and was_locked
+        )
+        if should_lock_after and app_name:
             relock_target = app_name
 
         if args and getattr(args, "create_version", False) and app_name:
@@ -608,11 +655,13 @@ def _app_push(
             )
             args.created_version_name = version_name
 
-        if (desired_lock or was_locked) and app_name:
+        if should_lock_after and app_name:
             print(f"Locking app {app_name} (locked=true)...")
-            apps_client.update_app(app_name, locked=True)
             relock_target = None
+            apps_client.update_app(app_name, locked=True)
             print(f"App {app_name} is locked.")
+        else:
+            relock_target = None
 
         return app_name
 
@@ -904,6 +953,68 @@ def app_lint(args: argparse.Namespace) -> None:
     )
     context.brand_id = getattr(args, "brand", None)
     context.channel = getattr(args, "channel", None)
+
+    if manifests_arg is not None:
+        from cxas_scrapi.build.manifests import (  # noqa: PLC0415
+            ManifestError,
+            load_manifests,
+        )
+
+        manifests_err: str | None = None
+        if not context.manifests_dir.is_dir():
+            manifests_err = (
+                f"Manifests directory not found: {context.manifests_dir}"
+            )
+        else:
+            try:
+                loaded_manifests = load_manifests(context.manifests_dir)
+                if (
+                    context.brand_id
+                    and context.brand_id not in loaded_manifests.brands
+                ):
+                    manifests_err = (
+                        f"Unknown brand '{context.brand_id}'. Known brands: "
+                        f"{sorted(loaded_manifests.brands)}"
+                    )
+                elif context.channel:
+                    eff_brand = context.brand_id
+                    if not eff_brand:
+                        from cxas_scrapi.utils.lint_rules.polymorphic import (  # noqa: PLC0415
+                            _deployment_metadata,
+                        )
+
+                        eff_brand, _ = _deployment_metadata(discovery.app_root)
+                    if eff_brand and eff_brand in loaded_manifests.policies:
+                        known_ch = loaded_manifests.policies[eff_brand].channels
+                        if context.channel not in known_ch:
+                            manifests_err = (
+                                f"Unknown channel '{context.channel}' for "
+                                f"brand '{eff_brand}'. Known channels: "
+                                f"{sorted(known_ch)}"
+                            )
+            except ManifestError as exc:
+                manifests_err = (
+                    f"Failed to load manifests from "
+                    f"'{context.manifests_dir}': {exc}"
+                )
+
+        if manifests_err:
+            if json_output:
+                print(
+                    json.dumps(
+                        [
+                            {
+                                "file": str(context.manifests_dir),
+                                "severity": "error",
+                                "rule_id": "SETUP",
+                                "message": manifests_err,
+                            }
+                        ]
+                    )
+                )
+            else:
+                print(f"ERROR: {manifests_err}", file=sys.stderr)
+            sys.exit(1)
 
     if not json_output:
         print(f"Linting app: {discovery.app_root.name}")

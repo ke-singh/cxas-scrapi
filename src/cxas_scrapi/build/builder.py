@@ -363,6 +363,50 @@ def _read_json_strict(path: Path) -> Any:
         raise BuildError(f"{path}: invalid JSON: {exc}") from exc
 
 
+_CONFIG_SUFFIXES = (".json", ".yaml", ".yml")
+
+
+def _read_config_strict(path: Path) -> Any:
+    try:
+        text = path.read_text("utf-8")
+        if path.suffix.lower() in (".yaml", ".yml"):
+            return yaml.safe_load(text)
+        return json.loads(text)
+    except (json.JSONDecodeError, yaml.YAMLError, OSError) as exc:
+        raise BuildError(f"{path}: invalid config: {exc}") from exc
+
+
+def _write_config(path: Path, data: dict[str, Any]) -> None:
+    if path.suffix.lower() in (".yaml", ".yml"):
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    else:
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _find_app_config(out_dir: Path) -> Path | None:
+    for suffix in _CONFIG_SUFFIXES:
+        candidate = out_dir / f"app{suffix}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _iter_resource_configs(out_dir: Path, subdir: str) -> list[Path]:
+    base = out_dir / subdir
+    if not base.is_dir():
+        return []
+    found: list[Path] = []
+    for res_dir in sorted(base.iterdir()):
+        if not res_dir.is_dir():
+            continue
+        for suffix in _CONFIG_SUFFIXES:
+            candidate = res_dir / f"{res_dir.name}{suffix}"
+            if candidate.is_file():
+                found.append(candidate)
+                break
+    return found
+
+
 def _set_model(holder: dict[str, Any], model: str) -> None:
     settings = holder.get("modelSettings")
     if not isinstance(settings, dict):
@@ -377,19 +421,16 @@ def _apply_model_pins(out_dir: Path, pins: ModelPins | None) -> None:
         return
 
     def _rewrite(path: Path, fn: Any) -> None:
-        data = _read_json_strict(path)
+        data = _read_config_strict(path)
         if isinstance(data, dict) and fn(data):
-            path.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+            _write_config(path, data)
 
     if pins.agent:
-        app_json = out_dir / "app.json"
-        if app_json.is_file():
-            _rewrite(app_json, lambda d: _set_model(d, pins.agent) or True)
-        for agent_json in sorted(out_dir.glob("agents/*/*.json")):
-            if agent_json.stem == agent_json.parent.name:
-                _rewrite(
-                    agent_json, lambda d: _set_model(d, pins.agent) or True
-                )
+        app_cfg = _find_app_config(out_dir)
+        if app_cfg is not None:
+            _rewrite(app_cfg, lambda d: _set_model(d, pins.agent) or True)
+        for agent_cfg in _iter_resource_configs(out_dir, "agents"):
+            _rewrite(agent_cfg, lambda d: _set_model(d, pins.agent) or True)
 
     if pins.guardrail:
 
@@ -406,8 +447,17 @@ def _apply_model_pins(out_dir: Path, pins: ModelPins | None) -> None:
                 changed = True
             return changed
 
-        for gr_json in sorted(out_dir.glob("guardrails/*/*.json")):
-            _rewrite(gr_json, _pin_guardrail)
+        gr_base = out_dir / "guardrails"
+        if gr_base.is_dir():
+            for gr_dir in sorted(gr_base.iterdir()):
+                if not gr_dir.is_dir():
+                    continue
+                for path in sorted(gr_dir.iterdir()):
+                    if (
+                        path.is_file()
+                        and path.suffix.lower() in _CONFIG_SUFFIXES
+                    ):
+                        _rewrite(path, _pin_guardrail)
 
     if pins.data_store:
 
@@ -415,8 +465,11 @@ def _apply_model_pins(out_dir: Path, pins: ModelPins | None) -> None:
             ds = d.get("dataStoreTool")
             if not isinstance(ds, dict):
                 return False
+            modality_configs = ds.get("modalityConfigs")
+            if not isinstance(modality_configs, list):
+                return False
             changed = False
-            for cfg in ds.get("modalityConfigs") or []:
+            for cfg in modality_configs:
                 if not isinstance(cfg, dict):
                     continue
                 for key in ("rewriterConfig", "summarizationConfig"):
@@ -429,21 +482,20 @@ def _apply_model_pins(out_dir: Path, pins: ModelPins | None) -> None:
                         changed = True
             return changed
 
-        for tool_json in sorted(out_dir.glob("tools/*/*.json")):
-            if tool_json.stem == tool_json.parent.name:
-                _rewrite(tool_json, _pin_data_store)
+        for tool_cfg in _iter_resource_configs(out_dir, "tools"):
+            _rewrite(tool_cfg, _pin_data_store)
 
 
 def _apply_lock_policy(out_dir: Path, locked: bool | None) -> None:
-    """Declares the governed lock in app.json (applied by ``cxas push``)."""
-    app_json = out_dir / "app.json"
-    if locked is None or not app_json.is_file():
+    """Declares the governed lock in app config (applied by ``cxas push``)."""
+    app_cfg = _find_app_config(out_dir)
+    if locked is None or app_cfg is None:
         return
-    data = _read_json_strict(app_json)
+    data = _read_config_strict(app_cfg)
     if not isinstance(data, dict):
-        raise BuildError(f"{app_json}: expected JSON object at top level")
+        raise BuildError(f"{app_cfg}: expected mapping at top level")
     data["locked"] = bool(locked)
-    app_json.write_text(json.dumps(data, indent=2) + "\n", "utf-8")
+    _write_config(app_cfg, data)
 
 
 def build_app(

@@ -167,9 +167,12 @@ class ModelPins(_StrictModel):
     @field_validator("agent", "guardrail", "data_store")
     @classmethod
     def _non_blank_model(cls, value: str | None) -> str | None:
-        if value is not None and not value.strip():
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
             raise ValueError("model pin must not be blank")
-        return value
+        return stripped
 
 
 class EnvManifest(_StrictModel):
