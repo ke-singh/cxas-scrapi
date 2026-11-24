@@ -17,11 +17,13 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import io
 import json
 import os
 import re
 import shutil
+import stat
 import tokenize
 from pathlib import Path
 from typing import Any
@@ -484,6 +486,24 @@ def _find_safe_subdir(
     return None
 
 
+def _ensure_tree_writable(root: Path) -> None:
+    """Ensure staged output files and dirs are owner-writable."""
+    for dirpath, _dirnames, filenames in os.walk(root):
+        dp = Path(dirpath)
+        with contextlib.suppress(OSError):
+            os.chmod(
+                dp,
+                dp.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR,
+            )
+        for fname in filenames:
+            fp = dp / fname
+            if not fp.is_symlink():
+                with contextlib.suppress(OSError):
+                    os.chmod(
+                        fp, fp.stat().st_mode | stat.S_IRUSR | stat.S_IWUSR
+                    )
+
+
 def _overlay_non_destructive(src_dir: Path, dst_dir: Path) -> None:
     """Copy ``src_dir`` into ``dst_dir`` without overwriting existing files."""
     ignore = shutil.ignore_patterns(*_STAGE_IGNORE_PATTERNS)
@@ -636,6 +656,7 @@ def build_app(
             out_dir,
             ignore=shutil.ignore_patterns(*_STAGE_IGNORE_PATTERNS),
         )
+    _ensure_tree_writable(out_dir)
 
     known_agents = (
         {p.name for p in (out_dir / "agents").iterdir() if p.is_dir()}

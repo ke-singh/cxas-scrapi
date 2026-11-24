@@ -160,7 +160,7 @@ def app_drift(args: argparse.Namespace) -> None:
 
 
 def app_backport(args: argparse.Namespace) -> None:
-    """Back-port live CES Console edits into brand `overrides.yaml`."""
+    """Back-port live CES Console edits into brand overrides or shared core."""
     json_output = bool(getattr(args, "json", False))
     bp_fn = backport_live_to_source
     if bp_fn is None:
@@ -372,8 +372,8 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     parser_backport = subparsers.add_parser(
         "backport",
         help=(
-            "Back-port live CES Console edits into brand overrides.yaml "
-            "with round-trip SHA-256 proof."
+            "Back-port live CES Console edits into brand overrides.yaml or "
+            "shared core/ with round-trip SHA-256 proof."
         ),
     )
     parser_backport.add_argument(
@@ -420,11 +420,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     parser_backport.add_argument(
         "--target",
-        choices=["brand"],
+        choices=["brand", "core"],
         default="brand",
         help=(
             "Backport destination ('brand' writes to "
-            "manifests/brands/<brand>/overrides.yaml)."
+            "manifests/brands/<brand>/overrides.yaml; 'core' promotes "
+            "changes into shared core/)."
         ),
     )
     parser_backport.add_argument(
@@ -442,7 +443,7 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         default=False,
         help=(
             "Compute changes, PR body, and round-trip proof without "
-            "modifying manifests, dist, lockfiles, or Git branches."
+            "modifying core/, manifests/, dist/, lockfiles, or Git branches."
         ),
     )
     parser_backport.add_argument(

@@ -1,0 +1,4 @@
+environment: dev
+templates:
+  api: https://dev.api.example.com/{brand_slug}/{service}
+overrides: {}
