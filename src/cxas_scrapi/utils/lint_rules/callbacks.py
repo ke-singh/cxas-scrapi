@@ -20,15 +20,12 @@ Validates agent callback Python files against CXAS conventions.
 import ast
 import re
 import warnings
-from pathlib import Path
+from collections.abc import Iterable
+from pathlib import Path, PurePosixPath
 
 import yaml
 
-from cxas_scrapi.core.python_bundler import (
-    BUNDLE_BEGIN_PREFIX,
-    BUNDLE_END_LINE,
-    BUNDLE_END_PREFIX,
-)
+from cxas_scrapi.core.python_bundler import inspect_shared_bundle
 from cxas_scrapi.utils.linter import (
     LintContext,
     LintResult,
@@ -597,67 +594,56 @@ def _collect_python_lib_imports(
     return imports
 
 
-def _check_bundle_markers(content: str) -> tuple[bool, bool]:
-    """Return ``(has_valid_bundle, is_malformed)`` for bundle markers."""
-    depth = 0
-    paired_count = 0
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(BUNDLE_BEGIN_PREFIX):
-            if depth != 0 or not stripped.endswith("==="):
-                return False, True
-            depth += 1
-        elif stripped == BUNDLE_END_LINE:
-            if depth != 1:
-                return False, True
-            depth -= 1
-            paired_count += 1
-        elif stripped.startswith(BUNDLE_END_PREFIX):
-            return False, True
-    if depth != 0 or paired_count > 1:
-        return False, True
-    return paired_count == 1, False
-
-
-def _safe_child_exists(
-    base: Path, parts: list[str], *, expect_dir: bool
+def _modules_cover_import(
+    modules: Iterable[str],
+    ancestor_packages: Iterable[str],
+    mod: str,
+    imported_name: str | None,
 ) -> bool:
+    """Return True if ``(mod, imported_name)`` is satisfied by bundled/declared
+    modules or their Python 3 namespace ancestor packages.
+    """
+    mod_set = modules if isinstance(modules, (set, frozenset)) else set(modules)
+    anc_set = (
+        ancestor_packages
+        if isinstance(ancestor_packages, (set, frozenset))
+        else set(ancestor_packages)
+    )
+    if mod in mod_set:
+        return True
+    if imported_name is None:
+        return mod in anc_set
+    if imported_name != "*":
+        full = f"{mod}.{imported_name}"
+        return full in mod_set or full in anc_set
+    return False
+
+
+def _resolve_safe_rel_path(base: Path, rel_path: str) -> Path | None:
+    """Resolve a relative POSIX path safely inside ``base`` without symlinks."""
+    if not rel_path or "\\" in rel_path or "\x00" in rel_path:
+        return None
+    pure = PurePosixPath(rel_path)
+    if pure.is_absolute() or not pure.parts:
+        return None
+    if any(part in ("", ".", "..") or ":" in part for part in pure.parts):
+        return None
     cur = base
-    for part in parts:
+    for part in pure.parts:
         cur = cur / part
         if cur.is_symlink():
-            return False
-    return cur.is_dir() if expect_dir else cur.is_file()
-
-
-def _native_env_has_module(
-    content_root: Path, mod: str, imported_name: str | None
-) -> bool:
-    parts = mod.split(".")
-    if _safe_child_exists(
-        content_root, [*parts[:-1], f"{parts[-1]}.py"], expect_dir=False
-    ):
-        return True
-    if _safe_child_exists(
-        content_root, [*parts, "__init__.py"], expect_dir=False
-    ):
-        return True
-    if imported_name and imported_name != "*":
-        if _safe_child_exists(
-            content_root, [*parts, f"{imported_name}.py"], expect_dir=False
+            return None
+    try:
+        resolved_base = base.resolve()
+        resolved_cur = cur.resolve()
+        if (
+            resolved_cur != resolved_base
+            and resolved_base not in resolved_cur.parents
         ):
-            return True
-        if _safe_child_exists(
-            content_root,
-            [*parts, imported_name, "__init__.py"],
-            expect_dir=False,
-        ):
-            return True
-    if imported_name is None and _safe_child_exists(
-        content_root, parts, expect_dir=True
-    ):
-        return bool(_iter_safe_py_files(content_root.joinpath(*parts)))
-    return False
+            return None
+    except OSError:
+        return None
+    return cur
 
 
 @rule("callbacks")
@@ -732,15 +718,17 @@ class SharedPythonBundleIntegrity(Rule):
                         )
                     )
 
-        # Part B: Validate pythonEnvFiles/pythonEnvFiles.yaml if present
+        # Part B: Validate pythonEnvFiles/pythonEnvFiles.yaml manifest & entries
         env_yaml = env_dir / "pythonEnvFiles.yaml"
-        content_py_lib = content_root / "python_lib"
-        has_valid_env_yaml = False
+        has_env_manifest = False
+        declared_modules: set[str] = set()
+        declared_ancestors: set[str] = set()
         if (
             not env_dir.is_symlink()
             and env_yaml.is_file()
             and not env_yaml.is_symlink()
         ):
+            env_yaml_rel = _rel(env_yaml)
             try:
                 parsed_env = yaml.safe_load(
                     env_yaml.read_text(encoding="utf-8")
@@ -748,7 +736,7 @@ class SharedPythonBundleIntegrity(Rule):
             except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
                 results.append(
                     self.make_result(
-                        file=_rel(env_yaml),
+                        file=env_yaml_rel,
                         severity=Severity.ERROR,
                         message=(
                             "Failed to parse pythonEnvFiles/"
@@ -762,20 +750,20 @@ class SharedPythonBundleIntegrity(Rule):
                     )
                 )
             else:
-                if isinstance(parsed_env, dict) and (
-                    "pythonEnvFiles" not in parsed_env
-                    or isinstance(parsed_env["pythonEnvFiles"], list)
-                ):
-                    has_valid_env_yaml = True
-                else:
+                entries = (
+                    parsed_env.get("pythonEnvFiles")
+                    if isinstance(parsed_env, dict)
+                    else None
+                )
+                if not isinstance(entries, list):
                     results.append(
                         self.make_result(
-                            file=_rel(env_yaml),
+                            file=env_yaml_rel,
                             severity=Severity.ERROR,
                             message=(
                                 "Invalid pythonEnvFiles/pythonEnvFiles.yaml: "
                                 "expected a YAML mapping with a "
-                                "pythonEnvFiles list."
+                                "'pythonEnvFiles' list."
                             ),
                             fix=(
                                 "Re-generate pythonEnvFiles/"
@@ -784,13 +772,153 @@ class SharedPythonBundleIntegrity(Rule):
                             ),
                         )
                     )
+                else:
+                    has_env_manifest = True
+                    content_safe = (
+                        not content_root.is_symlink() and content_root.is_dir()
+                    )
+                    for idx, entry in enumerate(entries, 1):
+                        if not isinstance(entry, dict):
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Entry #{idx} in "
+                                        "pythonEnvFiles/pythonEnvFiles.yaml "
+                                        "must be a mapping with 'name' and "
+                                        "'filePath'."
+                                    ),
+                                    fix=(
+                                        "Re-generate pythonEnvFiles/"
+                                        "pythonEnvFiles.yaml with cxas "
+                                        "build/package --native-python-env."
+                                    ),
+                                )
+                            )
+                            continue
+                        entry_name = entry.get("name")
+                        if not isinstance(entry_name, str) or not (
+                            entry_name.strip()
+                        ):
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Entry #{idx} in "
+                                        "pythonEnvFiles/pythonEnvFiles.yaml "
+                                        "is missing a non-empty 'name'."
+                                    ),
+                                    fix=(
+                                        "Provide a non-empty string 'name' "
+                                        "or re-generate pythonEnvFiles.yaml."
+                                    ),
+                                )
+                            )
+                        fp = entry.get("filePath")
+                        if not isinstance(fp, str) or not fp.strip():
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Entry #{idx} in "
+                                        "pythonEnvFiles/pythonEnvFiles.yaml "
+                                        "is missing a non-empty 'filePath'."
+                                    ),
+                                    fix=(
+                                        "Provide a relative 'filePath' under "
+                                        "content/ or re-generate "
+                                        "pythonEnvFiles.yaml."
+                                    ),
+                                )
+                            )
+                            continue
+                        target = _resolve_safe_rel_path(env_dir, fp)
+                        if target is None:
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Invalid or unsafe filePath '{fp}' "
+                                        "in pythonEnvFiles/pythonEnvFiles.yaml."
+                                    ),
+                                    fix=(
+                                        "Use a safe relative path under "
+                                        "pythonEnvFiles/content/ with no "
+                                        "symlinks or '..' segments."
+                                    ),
+                                )
+                            )
+                            continue
+                        if not target.is_file():
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Declared filePath '{fp}' in "
+                                        "pythonEnvFiles/pythonEnvFiles.yaml "
+                                        "does not exist on disk."
+                                    ),
+                                    fix=(
+                                        "Re-run cxas build/package "
+                                        "--native-python-env to sync "
+                                        "pythonEnvFiles.yaml with content/."
+                                    ),
+                                )
+                            )
+                            continue
+                        if not content_safe:
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Declared filePath '{fp}' requires a "
+                                        "non-symlink pythonEnvFiles/content/ "
+                                        "directory."
+                                    ),
+                                    fix=(
+                                        "Re-run cxas build/package "
+                                        "--native-python-env."
+                                    ),
+                                )
+                            )
+                            continue
+                        try:
+                            rel_content = target.relative_to(
+                                content_root
+                            ).as_posix()
+                        except ValueError:
+                            results.append(
+                                self.make_result(
+                                    file=env_yaml_rel,
+                                    severity=Severity.ERROR,
+                                    message=(
+                                        f"Declared filePath '{fp}' in "
+                                        "pythonEnvFiles/pythonEnvFiles.yaml "
+                                        "must reside under 'content/'."
+                                    ),
+                                    fix=(
+                                        "Place shared modules under "
+                                        "pythonEnvFiles/content/ and "
+                                        "re-generate pythonEnvFiles.yaml."
+                                    ),
+                                )
+                            )
+                            continue
+                        if rel_content.endswith(".py"):
+                            mod_name = rel_content[:-3].replace("/", ".")
+                            if mod_name.endswith(".__init__"):
+                                mod_name = mod_name[:-9]
+                            declared_modules.add(mod_name)
+                            parts = mod_name.split(".")
+                            for i in range(1, len(parts)):
+                                declared_ancestors.add(".".join(parts[:i]))
 
-        has_native_env = (
-            has_valid_env_yaml
-            and not content_root.is_symlink()
-            and content_py_lib.is_dir()
-            and not content_py_lib.is_symlink()
-        )
         local_py_lib = app_root / "python_lib"
         has_local_py_lib = (
             local_py_lib.is_dir() and not local_py_lib.is_symlink()
@@ -808,16 +936,13 @@ class SharedPythonBundleIntegrity(Rule):
             except (OSError, UnicodeDecodeError):
                 continue
 
-            has_valid_bundle, malformed_bundle = _check_bundle_markers(src)
-            if malformed_bundle:
+            inspection = inspect_shared_bundle(src, py_path)
+            if inspection.error is not None:
                 results.append(
                     self.make_result(
                         file=rel,
                         severity=Severity.ERROR,
-                        message=(
-                            "Malformed, truncated, or duplicate "
-                            "CXAS_SHARED_BUNDLE marker pair."
-                        ),
+                        message=inspection.error,
                         fix=(
                             "Re-bundle with cxas build/package or restore the "
                             "matching BEGIN/END CXAS_SHARED_BUNDLE markers."
@@ -834,13 +959,50 @@ class SharedPythonBundleIntegrity(Rule):
                 continue
 
             py_lib_imports = _collect_python_lib_imports(tree)
-            if not py_lib_imports or has_valid_bundle:
+            if not py_lib_imports:
                 continue
 
-            if has_native_env:
+            if inspection.has_bundle:
                 missing_reported: set[str] = set()
                 for mod, imp_name, lineno in py_lib_imports:
-                    if not _native_env_has_module(content_root, mod, imp_name):
+                    if not _modules_cover_import(
+                        inspection.bundled_modules,
+                        inspection.ancestor_packages,
+                        mod,
+                        imp_name,
+                    ):
+                        label = (
+                            f"{mod}.{imp_name}"
+                            if imp_name and imp_name != "*"
+                            else mod
+                        )
+                        if label in missing_reported:
+                            continue
+                        missing_reported.add(label)
+                        results.append(
+                            self.make_result(
+                                file=rel,
+                                line=lineno,
+                                severity=Severity.ERROR,
+                                message=(
+                                    f"Imports '{label}' which is not included "
+                                    "in the inline CXAS_SHARED_BUNDLE block."
+                                ),
+                                fix=(
+                                    "Re-run cxas build/package to refresh the "
+                                    "inline CXAS_SHARED_BUNDLE block."
+                                ),
+                            )
+                        )
+            elif has_env_manifest:
+                missing_reported = set()
+                for mod, imp_name, lineno in py_lib_imports:
+                    if not _modules_cover_import(
+                        declared_modules,
+                        declared_ancestors,
+                        mod,
+                        imp_name,
+                    ):
                         label = (
                             f"{mod}.{imp_name}"
                             if imp_name and imp_name != "*"
@@ -856,7 +1018,8 @@ class SharedPythonBundleIntegrity(Rule):
                                 severity=Severity.ERROR,
                                 message=(
                                     f"Imports '{label}' which is missing from "
-                                    "pythonEnvFiles/content/."
+                                    "pythonEnvFiles/content/ or "
+                                    "pythonEnvFiles/pythonEnvFiles.yaml."
                                 ),
                                 fix=(
                                     "Re-run cxas build/package with "

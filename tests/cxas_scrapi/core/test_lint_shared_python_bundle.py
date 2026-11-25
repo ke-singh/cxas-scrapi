@@ -373,6 +373,83 @@ def test_c025_cxaslint_severity_override_and_off(tmp_path: Path) -> None:
     assert rep_off.results == []
 
 
+def test_c025_inline_bundle_tamper_stale_and_docstring_markers(
+    tmp_path: Path,
+) -> None:
+    _make_minimal_app(tmp_path)
+    (tmp_path / "python_lib").mkdir(parents=True)
+    (tmp_path / "python_lib" / "helpers.py").write_text(
+        "def greet() -> str:\n    return 'hi'\n", encoding="utf-8"
+    )
+    tool_py = tmp_path / "tools" / "t1" / "python_function" / "python_code.py"
+    tool_py.parent.mkdir(parents=True)
+    tool_py.write_text(
+        "from python_lib.helpers import greet\n"
+        "def t1() -> dict:\n"
+        '    """Mention marker safely:\n'
+        f"    {BUNDLE_BEGIN_PREFIX} (sha256:0000000000000000) ===\n"
+        '    """\n'
+        "    return {'msg': greet()}\n",
+        encoding="utf-8",
+    )
+
+    bundle_shared_python(tmp_path)
+    bundled = tool_py.read_text(encoding="utf-8")
+    assert _run_c025(tmp_path).results == []
+
+    # Tampered payload fails digest check
+    tool_py.write_text(
+        bundled.replace("return 'hi'", "return 'hacked'", 1), encoding="utf-8"
+    )
+    rep_tampered = _run_c025(tmp_path)
+    assert len(rep_tampered.results) == 1
+    assert rep_tampered.results[0].severity == Severity.ERROR
+    assert "digest mismatch" in rep_tampered.results[0].message
+
+    # Stale bundle missing newly added import fails coverage check
+    tool_py.write_text(
+        bundled + "\nimport python_lib.extra_mod\n", encoding="utf-8"
+    )
+    rep_stale = _run_c025(tmp_path)
+    assert len(rep_stale.results) == 1
+    assert rep_stale.results[0].severity == Severity.ERROR
+    assert "python_lib.extra_mod" in rep_stale.results[0].message
+
+
+def test_c025_native_env_namespace_subpackage_and_unsafe_manifest_paths(
+    tmp_path: Path,
+) -> None:
+    _make_minimal_app(tmp_path)
+    (tmp_path / "python_lib" / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "python_lib" / "pkg" / "sub" / "mod.py").write_text(
+        "VAL = 42\n", encoding="utf-8"
+    )
+    tool_py = tmp_path / "tools" / "t1" / "python_function" / "python_code.py"
+    tool_py.parent.mkdir(parents=True)
+    tool_py.write_text(
+        "from python_lib.pkg import sub\n"
+        "def t1() -> dict:\n"
+        "    return {'v': sub.mod.VAL}\n",
+        encoding="utf-8",
+    )
+
+    synthesize_python_env_files(tmp_path)
+    assert _run_c025(tmp_path).results == []
+
+    # Path traversal in pythonEnvFiles.yaml is rejected
+    (tmp_path / "pythonEnvFiles" / "pythonEnvFiles.yaml").write_text(
+        "pythonEnvFiles:\n  - name: evil\n    filePath: ../app.json\n",
+        encoding="utf-8",
+    )
+    rep_traversal = _run_c025(tmp_path)
+    assert any(
+        r.file == "pythonEnvFiles/pythonEnvFiles.yaml"
+        and r.severity == Severity.ERROR
+        and "unsafe filePath" in r.message
+        for r in rep_traversal.results
+    )
+
+
 def test_sample_support_agent_clean_with_c025_registered() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     template_root = (
