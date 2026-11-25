@@ -18,15 +18,25 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import os
 import re
 import shutil
+import tokenize
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
 MAX_BUNDLE_BYTES_PER_FILE = 64 * 1024
 MAX_TOTAL_ARCHIVE_BYTES = 32 * 1024 * 1024
+
+BUNDLE_BEGIN_PREFIX = "# === BEGIN CXAS_SHARED_BUNDLE"
+BUNDLE_END_PREFIX = "# === END CXAS_SHARED_BUNDLE"
+BUNDLE_END_LINE = f"{BUNDLE_END_PREFIX} ==="
+BUNDLE_BEGIN_RE = re.compile(
+    rf"^{re.escape(BUNDLE_BEGIN_PREFIX)} \(sha256:([a-f0-9]{{16}})\) ===$"
+)
 
 
 class PythonBundlerError(Exception):
@@ -368,7 +378,7 @@ def _render_bundle(
     """
     digest = _bundle_digest(sorted_modules)
     bundle_lines = [
-        f"# === BEGIN CXAS_SHARED_BUNDLE (sha256:{digest}) ===",
+        f"{BUNDLE_BEGIN_PREFIX} (sha256:{digest}) ===",
         "import sys as _cxas_sys, types as _cxas_types",
         f'_CXAS_DIGEST = "{digest}"',
         '_CXAS_KEEP = ("__name__", "__package__", "__loader__", "__spec__", "__path__", "__builtins__")',  # noqa: E501
@@ -436,7 +446,7 @@ def _render_bundle(
         )
         bundle_lines.append(f'    _cxas_mod.__cxas_digest__ = "{mod_digest}"')
 
-    bundle_lines.append("# === END CXAS_SHARED_BUNDLE ===")
+    bundle_lines.append(BUNDLE_END_LINE)
     return digest, "\n".join(bundle_lines) + "\n"
 
 
@@ -771,11 +781,12 @@ def _local_module_source(local_source_dir: Path, module: str) -> str | None:
 
 _MEMORY_ENTRYPOINT = Path("<memory>")
 _BUNDLE_MARKER_REGEX = re.compile(
-    r"^(# === BEGIN CXAS_SHARED_BUNDLE \(sha256:([a-f0-9]{16})\) ===\r?\n.*?^# === END CXAS_SHARED_BUNDLE ===(?:\r?\n)?)",  # noqa: E501
+    rf"^({re.escape(BUNDLE_BEGIN_PREFIX)} \(sha256:([a-f0-9]{{16}})\) ===\r?\n.*?^{re.escape(BUNDLE_END_LINE)}(?:\r?\n)?)",  # noqa: E501
     re.MULTILINE | re.DOTALL,
 )
 _ANY_BUNDLE_MARKER_REGEX = re.compile(
-    r"^# === (?:BEGIN|END) CXAS_SHARED_BUNDLE\b", re.MULTILINE
+    rf"^(?:{re.escape(BUNDLE_BEGIN_PREFIX)}|{re.escape(BUNDLE_END_PREFIX)})\b",
+    re.MULTILINE,
 )
 
 
@@ -953,3 +964,129 @@ def strip_shared_bundles(
 
 def _normalize_block(text: str) -> str:
     return text.replace("\r\n", "\n").strip("\r\n")
+
+
+@dataclass(frozen=True)
+class SharedBundleInspection:
+    """Result of inspecting an entrypoint for a ``CXAS_SHARED_BUNDLE``."""
+
+    has_bundle: bool
+    bundled_modules: frozenset[str] = frozenset()
+    ancestor_packages: frozenset[str] = frozenset()
+    error: str | None = None
+
+
+def _extract_top_level_bundle_markers(content: str) -> list[tuple[int, str]]:
+    """Return ``[(lineno, text), ...]`` for column-0 bundle marker comments.
+
+    Uses Python's tokenizer so markers inside string literals or docstrings
+    (``tokenize.STRING``) and indented comments (``col > 0``) are ignored.
+    Falls back to column-0 line scanning if tokenization fails on malformed
+    syntax.
+    """
+    markers: list[tuple[int, str]] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(content).readline):
+            if tok.type != tokenize.COMMENT or tok.start[1] != 0:
+                continue
+            text = tok.string.rstrip("\r\n")
+            if text.startswith(BUNDLE_BEGIN_PREFIX) or text.startswith(
+                BUNDLE_END_PREFIX
+            ):
+                markers.append((tok.start[0], text))
+        return markers
+    except (tokenize.TokenError, IndentationError):
+        fallback: list[tuple[int, str]] = []
+        for lineno, raw_line in enumerate(content.splitlines(), 1):
+            if raw_line[:1].isspace():
+                continue
+            text = raw_line.rstrip("\r\n")
+            if text.startswith(BUNDLE_BEGIN_PREFIX) or text.startswith(
+                BUNDLE_END_PREFIX
+            ):
+                fallback.append((lineno, text))
+        return fallback
+
+
+def inspect_shared_bundle(content: str, ep: Path) -> SharedBundleInspection:
+    """Validate an entrypoint's ``CXAS_SHARED_BUNDLE`` block, if present.
+
+    Checks column-0 comment markers (ignoring strings/docstrings), strict
+    ``(sha256:<16-hex>)`` header syntax, exact digest/AST/byte match against
+    ``_render_bundle``, and returns the embedded module and ancestor package
+    sets.
+    """
+    markers = _extract_top_level_bundle_markers(content)
+    if not markers:
+        return SharedBundleInspection(has_bundle=False)
+
+    if len(markers) != 2:  # noqa: PLR2004
+        return SharedBundleInspection(
+            has_bundle=True,
+            error=(
+                "Malformed, truncated, or duplicate CXAS_SHARED_BUNDLE "
+                "marker pair."
+            ),
+        )
+
+    (begin_line, begin_text), (end_line, end_text) = markers
+    begin_match = BUNDLE_BEGIN_RE.match(begin_text)
+    if begin_match is None:
+        return SharedBundleInspection(
+            has_bundle=True,
+            error=(
+                "Malformed CXAS_SHARED_BUNDLE BEGIN marker (expected "
+                "'# === BEGIN CXAS_SHARED_BUNDLE (sha256:<16-hex>) ===')."
+            ),
+        )
+    if end_text != BUNDLE_END_LINE:
+        return SharedBundleInspection(
+            has_bundle=True,
+            error="Malformed or truncated CXAS_SHARED_BUNDLE END marker.",
+        )
+
+    lines = content.splitlines(keepends=True)
+    bundle_text = "".join(lines[begin_line - 1 : end_line])
+    expected_digest = begin_match.group(1)
+
+    try:
+        parsed_modules, packages, tree = _parse_bundled_modules(bundle_text, ep)
+    except BundleDigestMismatchError as exc:
+        return SharedBundleInspection(
+            has_bundle=True,
+            error=f"Invalid CXAS_SHARED_BUNDLE block: {exc}",
+        )
+
+    sorted_modules = _topo_sort_modules(parsed_modules, packages)
+    actual_digest, expected_text = _render_bundle(sorted_modules, packages)
+
+    if actual_digest != expected_digest:
+        return SharedBundleInspection(
+            has_bundle=True,
+            error=(
+                "Tampered CXAS_SHARED_BUNDLE digest mismatch "
+                f"(header={expected_digest}, computed={actual_digest})."
+            ),
+        )
+    if ast.dump(ast.parse(expected_text)) != ast.dump(tree):
+        return SharedBundleInspection(
+            has_bundle=True,
+            error="Tampered CXAS_SHARED_BUNDLE block: unexpected statements.",
+        )
+    if _normalize_block(bundle_text) != _normalize_block(expected_text):
+        return SharedBundleInspection(
+            has_bundle=True,
+            error="Tampered CXAS_SHARED_BUNDLE block: unexpected content.",
+        )
+
+    ancestor_packages: set[str] = set(packages)
+    for mod in parsed_modules:
+        parts = mod.split(".")
+        for i in range(1, len(parts)):
+            ancestor_packages.add(".".join(parts[:i]))
+
+    return SharedBundleInspection(
+        has_bundle=True,
+        bundled_modules=frozenset(parsed_modules),
+        ancestor_packages=frozenset(ancestor_packages),
+    )
