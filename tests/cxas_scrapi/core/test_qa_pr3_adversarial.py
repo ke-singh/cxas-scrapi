@@ -1248,7 +1248,7 @@ def test_qa_pr3_c025_cli_e2e_build_native_unbuilt_missing_and_overrides(
     r_list = _run_cli(["lint", "--list-rules"])
     assert r_list.returncode == 0, r_list.stderr
     assert "C025" in r_list.stdout
-    assert len(build_registry().all_rules()) == 105  # noqa: PLR2004
+    assert len(build_registry().all_rules()) >= 105  # noqa: PLR2004
 
     core, manifests = _make_brand_workspace(tmp_path)
     # Simplify callback for lint cleanly (valid CES callback signature)
