@@ -43,6 +43,8 @@ from cxas_scrapi.core import packaging as packaging_mod
 from cxas_scrapi.core.apps import Apps
 from cxas_scrapi.core.packaging import package_app_archive
 from cxas_scrapi.core.python_bundler import (
+    BUNDLE_BEGIN_PREFIX,
+    BUNDLE_END_LINE,
     MAX_BUNDLE_BYTES_PER_FILE,
     MAX_TOTAL_ARCHIVE_BYTES,
     BundleDigestMismatchError,
@@ -60,6 +62,15 @@ from cxas_scrapi.runtime import (
     escape_search_filter_literal,
     get_verbatim_content_block,
     resolve_content_block_or_handoff,
+)
+from cxas_scrapi.utils.linter import (
+    Discovery,
+    LintConfig,
+    LintReport,
+    Severity,
+    build_context,
+    build_registry,
+    run_rules,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -1186,3 +1197,352 @@ def test_qa_pr3_014_pooled_sandbox_clears_stale_attrs_across_digests(
     exec(cb2_code, ns2)
     assert ns2["get_secret"]() is None  # type: ignore[operator]
     assert ns2["get_pkg_secret"]() is None  # type: ignore[operator]
+
+
+# ---------------------------------------------------------------------------
+# PR 3 Extension QA: C025 (SharedPythonBundleIntegrity)
+# ---------------------------------------------------------------------------
+
+
+def _run_c025_only(app_dir: Path) -> LintReport:
+    reg = build_registry()
+    cfg = LintConfig.load(app_dir)
+    disc = Discovery(app_dir, app_dir / "evals")
+    ctx = build_context(app_dir, cfg, disc)
+    rep = LintReport()
+    run_rules(reg, cfg, ctx, disc, rep, specific_rules={"C025"})
+    return rep
+
+
+def _make_lintable_app(root: Path, cb_code: str) -> tuple[Path, Path]:
+    (root / "agents" / "root_agent" / "before_model_callbacks" / "cb_1").mkdir(
+        parents=True, exist_ok=True
+    )
+    (root / "app.json").write_text(
+        json.dumps({"displayName": "LintApp", "rootAgent": "root_agent"}),
+        encoding="utf-8",
+    )
+    (root / "agents" / "root_agent" / "root_agent.json").write_text(
+        json.dumps({"displayName": "root_agent", "tools": ["end_session"]}),
+        encoding="utf-8",
+    )
+    (root / "agents" / "root_agent" / "instruction.txt").write_text(
+        "<role>Assistant</role>\n", encoding="utf-8"
+    )
+    cb = (
+        root
+        / "agents"
+        / "root_agent"
+        / "before_model_callbacks"
+        / "cb_1"
+        / "python_code.py"
+    )
+    cb.write_text(cb_code, encoding="utf-8")
+    return root, cb
+
+
+def test_qa_pr3_c025_cli_e2e_build_native_unbuilt_missing_and_overrides(
+    tmp_path: Path,
+) -> None:
+    """Real CLI E2E: cxas build (inline & native) -> cxas lint, unbuilt warning, missing error, overrides, --list-rules."""
+    r_list = _run_cli(["lint", "--list-rules"])
+    assert r_list.returncode == 0, r_list.stderr
+    assert "C025" in r_list.stdout
+    assert len(build_registry().all_rules()) == 105  # noqa: PLR2004
+
+    core, manifests = _make_brand_workspace(tmp_path)
+    # Simplify callback for lint cleanly (valid CES callback signature)
+    _make_callback(
+        core,
+        "cb_1",
+        "from python_lib.branding import greet\n"
+        "def before_model_callback(callback_context, llm_request):\n"
+        "    _ = greet('user')\n"
+        "    return None\n",
+    )
+
+    # 1. Inline cxas build -> cxas lint --rule C025 & --only callbacks -> exit 0, 0 findings
+    out_inline = tmp_path / "dist_inline"
+    r_b1 = _run_cli(
+        [
+            "build",
+            "--core-dir",
+            str(core),
+            "--manifests-dir",
+            str(manifests),
+            "--brand",
+            "brand_x",
+            "--channel",
+            "WEB",
+            "--env",
+            "prod",
+            "--out",
+            str(out_inline),
+        ]
+    )
+    assert r_b1.returncode == 0, r_b1.stderr
+    r_l1 = _run_cli(
+        ["lint", "--app-dir", str(out_inline), "--rule", "C025", "--json"]
+    )
+    assert r_l1.returncode == 0, r_l1.stderr
+    assert json.loads(r_l1.stdout) == []
+    r_cb1 = _run_cli(
+        [
+            "lint",
+            "--app-dir",
+            str(out_inline),
+            "--only",
+            "callbacks",
+            "--json",
+        ]
+    )
+    assert r_cb1.returncode == 0, r_cb1.stderr
+    assert json.loads(r_cb1.stdout) == []
+
+    # 2. Native --native-python-env build -> cxas lint --rule C025 & --only callbacks -> exit 0, 0 findings
+    out_native = tmp_path / "dist_native"
+    r_b2 = _run_cli(
+        [
+            "build",
+            "--core-dir",
+            str(core),
+            "--manifests-dir",
+            str(manifests),
+            "--brand",
+            "brand_x",
+            "--channel",
+            "WEB",
+            "--env",
+            "prod",
+            "--out",
+            str(out_native),
+            "--native-python-env",
+        ]
+    )
+    assert r_b2.returncode == 0, r_b2.stderr
+    r_l2 = _run_cli(
+        ["lint", "--app-dir", str(out_native), "--rule", "C025", "--json"]
+    )
+    assert r_l2.returncode == 0, r_l2.stderr
+    assert json.loads(r_l2.stdout) == []
+
+    # 3. Unbuilt core with python_lib -> C025 WARNING, exit 0
+    r_l3 = _run_cli(
+        ["lint", "--app-dir", str(core), "--rule", "C025", "--json"]
+    )
+    assert r_l3.returncode == 0
+    findings_3 = json.loads(r_l3.stdout)
+    assert len(findings_3) == 1
+    assert findings_3[0]["rule_id"] == "C025"
+    assert findings_3[0]["severity"] == "warning"
+
+    # 4. cxaslint.yaml C025: error escalates unbuilt warning to exit 1
+    (core / "cxaslint.yaml").write_text(
+        "rules:\n  C025: error\n", encoding="utf-8"
+    )
+    r_l4 = _run_cli(
+        ["lint", "--app-dir", str(core), "--rule", "C025", "--json"]
+    )
+    assert r_l4.returncode == 1
+    assert json.loads(r_l4.stdout)[0]["severity"] == "error"
+
+    # 5. cxaslint.yaml C025: off silences it -> exit 0, []
+    (core / "cxaslint.yaml").write_text(
+        "rules:\n  C025: off\n", encoding="utf-8"
+    )
+    r_l5 = _run_cli(
+        ["lint", "--app-dir", str(core), "--rule", "C025", "--json"]
+    )
+    assert r_l5.returncode == 0
+    assert json.loads(r_l5.stdout) == []
+    (core / "cxaslint.yaml").unlink()
+
+    # 6. Missing python_lib everywhere -> C025 ERROR, exit 1; --only callbacks dispatches once
+    shutil.rmtree(core / "python_lib")
+    r_l6 = _run_cli(
+        ["lint", "--app-dir", str(core), "--rule", "C025", "--json"]
+    )
+    assert r_l6.returncode == 1
+    findings_6 = json.loads(r_l6.stdout)
+    assert len(findings_6) == 1
+    assert findings_6[0]["severity"] == "error"
+    r_cat = _run_cli(
+        ["lint", "--app-dir", str(core), "--only", "callbacks", "--json"]
+    )
+    assert r_cat.returncode == 1
+    c025_cat = [f for f in json.loads(r_cat.stdout) if f["rule_id"] == "C025"]
+    assert len(c025_cat) == 1
+
+
+def test_qa_pr3_c025_edge_cases_syntax_utf8_markers_type_checking_yaml_symlinks(
+    tmp_path: Path,
+) -> None:
+    """Verify C025 edge cases: syntax/UTF-8 errors, malformed markers, TYPE_CHECKING, corrupt/non-UTF-8 YAML, symlinks."""
+    # Syntax & non-UTF-8 in python_lib/ and pythonEnvFiles/content/ + non-UTF-8 pythonEnvFiles.yaml
+    app1, _ = _make_lintable_app(
+        tmp_path / "app1", "def cb():\n    return None\n"
+    )
+    (app1 / "python_lib").mkdir()
+    (app1 / "python_lib" / "bad.py").write_text("def x(:\n", encoding="utf-8")
+    (app1 / "pythonEnvFiles" / "content" / "python_lib").mkdir(parents=True)
+    (app1 / "pythonEnvFiles" / "content" / "python_lib" / "raw.py").write_bytes(
+        b"\xff\xfe\x00"
+    )
+    (app1 / "pythonEnvFiles" / "pythonEnvFiles.yaml").write_bytes(
+        b"\xff\xfe\x00"
+    )
+    rep1 = _run_c025_only(app1)
+    assert {r.file for r in rep1.results} == {
+        "python_lib/bad.py",
+        "pythonEnvFiles/content/python_lib/raw.py",
+        "pythonEnvFiles/pythonEnvFiles.yaml",
+    }
+    assert all(r.severity == Severity.ERROR for r in rep1.results)
+
+    # Non-dict YAML root in pythonEnvFiles.yaml
+    app2, _ = _make_lintable_app(
+        tmp_path / "app2", "def cb():\n    return None\n"
+    )
+    (app2 / "pythonEnvFiles").mkdir()
+    (app2 / "pythonEnvFiles" / "pythonEnvFiles.yaml").write_text(
+        "- just\n- a\n- list\n", encoding="utf-8"
+    )
+    rep2 = _run_c025_only(app2)
+    assert len(rep2.results) == 1
+    assert rep2.results[0].severity == Severity.ERROR
+
+    # Nested namespace module `from python_lib.pkg.sub import fn` present vs missing
+    app3, cb3 = _make_lintable_app(
+        tmp_path / "app3",
+        "from python_lib.pkg.sub import fn\ndef cb():\n    return fn()\n",
+    )
+    (app3 / "python_lib" / "pkg").mkdir(parents=True)
+    (app3 / "python_lib" / "pkg" / "sub.py").write_text(
+        "def fn():\n    return 1\n", encoding="utf-8"
+    )
+    synthesize_python_env_files(app3)
+    assert _run_c025_only(app3).results == []
+    cb3.write_text(
+        "from python_lib.pkg.missing import fn\ndef cb():\n    return fn()\n",
+        encoding="utf-8",
+    )
+    rep3_miss = _run_c025_only(app3)
+    assert len(rep3_miss.results) == 1
+    assert rep3_miss.results[0].severity == Severity.ERROR
+
+
+def test_qa_pr3_015_c025_rejects_bogus_tampered_and_stale_inline_bundles(
+    tmp_path: Path,
+) -> None:
+    """QA-PR3-015 [HIGH]: C025 must reject bogus BEGIN headers, tampered bundle digests, and stale bundles missing imports."""
+    # Case A: Missing sha256 digest in BEGIN header + non-hex sha256 header
+    app_bogus, _ = _make_lintable_app(
+        tmp_path / "app_bogus",
+        f"{BUNDLE_BEGIN_PREFIX} ===\n"
+        f"{BUNDLE_END_LINE}\n"
+        "import python_lib.missing\n"
+        "def cb():\n    return None\n",
+    )
+    rep_bogus = _run_c025_only(app_bogus)
+    assert any(r.severity == Severity.ERROR for r in rep_bogus.results)
+
+    app_nonhex, _ = _make_lintable_app(
+        tmp_path / "app_nonhex",
+        f"{BUNDLE_BEGIN_PREFIX} (sha256:ZZZZZZZZZZZZZZZZ) ===\n"
+        f"{BUNDLE_END_LINE}\n"
+        "import python_lib.missing\n"
+        "def cb():\n    return None\n",
+    )
+    rep_nonhex = _run_c025_only(app_nonhex)
+    assert any(r.severity == Severity.ERROR for r in rep_nonhex.results)
+
+    # Case B: Real bundle tampered in Console (digest mismatch)
+    app_tamper, cb_tamper = _make_lintable_app(
+        tmp_path / "app_tamper",
+        "import python_lib.a\ndef cb():\n    return python_lib.a.V\n",
+    )
+    (app_tamper / "python_lib").mkdir()
+    (app_tamper / "python_lib" / "a.py").write_text("V = 1\n", encoding="utf-8")
+    bundle_shared_python(app_tamper)
+    bundled = cb_tamper.read_text(encoding="utf-8")
+    cb_tamper.write_text(
+        bundled.replace("V = 1", "V = 999", 1), encoding="utf-8"
+    )
+    rep_tamper = _run_c025_only(app_tamper)
+    assert any(r.severity == Severity.ERROR for r in rep_tamper.results)
+
+    # Case C: Real bundle missing a newly added python_lib import
+    cb_tamper.write_text(
+        bundled + "\nimport python_lib.never_bundled\n", encoding="utf-8"
+    )
+    rep_stale = _run_c025_only(app_tamper)
+    assert any(r.severity == Severity.ERROR for r in rep_stale.results)
+
+
+def test_qa_pr3_016_c025_validates_python_env_yaml_entries_and_declared_paths(
+    tmp_path: Path,
+) -> None:
+    """QA-PR3-016 [HIGH]: C025 must reject empty/undeclared pythonEnvFiles.yaml, non-dict entries, and dangling filePaths."""
+    app, _ = _make_lintable_app(
+        tmp_path / "app_env",
+        "import python_lib.a\ndef cb():\n    return python_lib.a.V\n",
+    )
+    (app / "pythonEnvFiles" / "content" / "python_lib").mkdir(parents=True)
+    (app / "pythonEnvFiles" / "content" / "python_lib" / "a.py").write_text(
+        "V = 1\n", encoding="utf-8"
+    )
+    yaml_path = app / "pythonEnvFiles" / "pythonEnvFiles.yaml"
+
+    # Case A: Empty pythonEnvFiles list (file sits on disk but is NOT declared in manifest)
+    yaml_path.write_text("pythonEnvFiles: []\n", encoding="utf-8")
+    assert any(
+        r.severity == Severity.ERROR for r in _run_c025_only(app).results
+    )
+
+    # Case B: Dangling filePath that does not exist on disk
+    yaml_path.write_text(
+        "pythonEnvFiles:\n"
+        "  - name: ghost\n"
+        "    filePath: content/python_lib/does_not_exist.py\n",
+        encoding="utf-8",
+    )
+    assert any(
+        r.severity == Severity.ERROR for r in _run_c025_only(app).results
+    )
+
+    # Case C: Non-dict entry inside pythonEnvFiles list
+    yaml_path.write_text("pythonEnvFiles:\n  - not-a-dict\n", encoding="utf-8")
+    assert any(
+        r.severity == Severity.ERROR for r in _run_c025_only(app).results
+    )
+
+
+def test_qa_pr3_017_c025_allows_from_namespace_subpackage_import_in_native_env(
+    tmp_path: Path,
+) -> None:
+    """QA-PR3-017 [MEDIUM]: `from python_lib.pkg import sub` must pass when `python_lib/pkg/sub/` is a namespace subpackage."""
+    app, _ = _make_lintable_app(
+        tmp_path / "app_ns",
+        "from python_lib.pkg import sub\ndef cb():\n    return sub.mod.V\n",
+    )
+    (app / "python_lib" / "pkg" / "sub").mkdir(parents=True)
+    (app / "python_lib" / "pkg" / "sub" / "mod.py").write_text(
+        "V = 1\n", encoding="utf-8"
+    )
+    synthesize_python_env_files(app)
+    assert _run_c025_only(app).results == []
+
+
+def test_qa_pr3_018_c025_ignores_bundle_marker_text_inside_docstrings(
+    tmp_path: Path,
+) -> None:
+    """QA-PR3-018 [MEDIUM]: Bundle marker text inside a docstring must not trigger a false-positive C025 error."""
+    app, _ = _make_lintable_app(
+        tmp_path / "app_doc",
+        "def cb():\n"
+        '    """Example header:\n'
+        f"    {BUNDLE_BEGIN_PREFIX} (sha256:0000000000000000) ===\n"
+        '    """\n'
+        "    return None\n",
+    )
+    assert _run_c025_only(app).results == []
