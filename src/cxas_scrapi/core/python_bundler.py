@@ -28,6 +28,10 @@ import yaml
 MAX_BUNDLE_BYTES_PER_FILE = 64 * 1024
 MAX_TOTAL_ARCHIVE_BYTES = 32 * 1024 * 1024
 
+BUNDLE_BEGIN_PREFIX = "# === BEGIN CXAS_SHARED_BUNDLE"
+BUNDLE_END_PREFIX = "# === END CXAS_SHARED_BUNDLE"
+BUNDLE_END_LINE = f"{BUNDLE_END_PREFIX} ==="
+
 
 class PythonBundlerError(Exception):
     pass
@@ -368,7 +372,7 @@ def _render_bundle(
     """
     digest = _bundle_digest(sorted_modules)
     bundle_lines = [
-        f"# === BEGIN CXAS_SHARED_BUNDLE (sha256:{digest}) ===",
+        f"{BUNDLE_BEGIN_PREFIX} (sha256:{digest}) ===",
         "import sys as _cxas_sys, types as _cxas_types",
         f'_CXAS_DIGEST = "{digest}"',
         '_CXAS_KEEP = ("__name__", "__package__", "__loader__", "__spec__", "__path__", "__builtins__")',  # noqa: E501
@@ -436,7 +440,7 @@ def _render_bundle(
         )
         bundle_lines.append(f'    _cxas_mod.__cxas_digest__ = "{mod_digest}"')
 
-    bundle_lines.append("# === END CXAS_SHARED_BUNDLE ===")
+    bundle_lines.append(BUNDLE_END_LINE)
     return digest, "\n".join(bundle_lines) + "\n"
 
 
@@ -570,7 +574,7 @@ def bundle_shared_python(
     validated: set[str] = set()
     results: dict[str, int] = {}
     marker_begin_regex = re.compile(
-        r"^# === BEGIN CXAS_SHARED_BUNDLE \(sha256:[a-f0-9]{16}\) ===\r?\n.*?^# === END CXAS_SHARED_BUNDLE ===(?:\r?\n)?",  # noqa: E501
+        rf"^{re.escape(BUNDLE_BEGIN_PREFIX)} \(sha256:[a-f0-9]{{16}}\) ===\r?\n.*?^{re.escape(BUNDLE_END_LINE)}(?:\r?\n)?",  # noqa: E501
         re.MULTILINE | re.DOTALL,
     )
 
@@ -771,11 +775,12 @@ def strip_shared_bundles(
     entrypoints = _discover_entrypoints(app_dir)
 
     marker_regex = re.compile(
-        r"^(# === BEGIN CXAS_SHARED_BUNDLE \(sha256:([a-f0-9]{16})\) ===\r?\n.*?^# === END CXAS_SHARED_BUNDLE ===(?:\r?\n)?)",  # noqa: E501
+        rf"^({re.escape(BUNDLE_BEGIN_PREFIX)} \(sha256:([a-f0-9]{{16}})\) ===\r?\n.*?^{re.escape(BUNDLE_END_LINE)}(?:\r?\n)?)",  # noqa: E501
         re.MULTILINE | re.DOTALL,
     )
     any_marker_regex = re.compile(
-        r"^# === (?:BEGIN|END) CXAS_SHARED_BUNDLE\b", re.MULTILINE
+        rf"^(?:{re.escape(BUNDLE_BEGIN_PREFIX)}|{re.escape(BUNDLE_END_PREFIX)})\b",
+        re.MULTILINE,
     )
 
     stripped: list[Path] = []
